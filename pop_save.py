@@ -240,6 +240,45 @@ def walk_property_declarations(decompressed, start, end=None):
     return out
 
 
+# 24-byte type-manifest entries: [3 zero bytes][u32 type hash][2 zero bytes][kind][14 zero bytes].
+# These describe a field's TYPE, they do not hold its value.
+#
+# Worth being blunt about the trap here, because two separate "confirmed offsets" in this file were
+# retracted after falling into it: the single interesting-looking byte in one of these entries is
+# the schema's own `kind` code, not data. That's why entries for TrapType/MagicPlateType all read
+# 25 (0x19 = kind Enum) and why the old StaminaBonus* offsets all read 7 (0x07 = kind u32) -- a
+# constant that looks like a plausible value is much more likely to be a type tag than a real one.
+# The give-away is the hash: it resolves to an enum's TYPE name (e.g. "MissionItemState") or a
+# "Class::Field" debug name, and the byte never varies across the whole corpus.
+#
+# Kept because the manifest is genuinely useful for LOCATING a record's value blob (walking these
+# entries tells you where the type descriptions stop and real data starts, which is how
+# MissionItem's 6-byte blob was pinned down), just never for reading a value out of.
+def scan_type_manifest_entries(decompressed):
+    """Every 24-byte type-manifest entry in the buffer. Returns [(offset, hash, name, kind), ...].
+    Position-independent (the hash is the identity, not the declaration order), and validated
+    against the schema's own name table -- an entry is only accepted if its hash resolves to a real
+    name, which keeps this from matching coincidental zero-padded regions elsewhere in the file.
+
+    The 4th tuple element is a schema KIND code (see save_schema.PRIM_WIDTH), not a value."""
+    out = []
+    n = len(decompressed)
+    for i in range(0, n - 24):
+        if decompressed[i] or decompressed[i + 1] or decompressed[i + 2]:
+            continue
+        if decompressed[i + 7] or decompressed[i + 8]:
+            continue
+        if decompressed[i + 10:i + 24] != b'\x00' * 14:
+            continue
+        h = struct.unpack_from('<I', decompressed, i + 3)[0]
+        name = names_lookup(h)
+        # Accept any hash the schema can name -- entries point at either a bare type name
+        # ("MissionItemState") or a "Class::Field" debug name, and both are real.
+        if not name.startswith('0x'):
+            out.append((i, h, name, decompressed[i + 9]))
+    return out
+
+
 def enumerate_savegameobjects(decompressed):
     """List every SaveGameObject-typed record in the decompressed blob1 buffer.
 
@@ -503,11 +542,18 @@ CONFIRMED_VALUE_OFFSETS = {
     # The Cauldron - one byte flipped, and it landed on DeflectLocked, which lines up (that's one
     # of the first moves you unlock there).
     #
-    # The 8 StaminaBonus* offsets used to be listed here too but they were wrong - turned out to be
-    # reading a type tag, not a real value (every save read the same literal 7, which is what a
-    # tag byte looks like, not 7 different bonus amounts). Couldn't find where the real values live
-    # anywhere in this save corpus, so those fields just show "value position not yet confirmed"
-    # instead of a made-up number.
+    # Both halves sit in one value blob at the end of the record, same length-prefixed shape as
+    # MissionItem's: a u32 at +537, then 19 bools at 541..559 and the 8 StaminaBonus* ints at
+    # 560..591 (4 bytes each, declared order). Byte 540 is a leading pad -- it reads 0 in all 106
+    # saves, whereas 559 flips between 0 and 1, which is what fixes the bool run at 541 rather than
+    # 540 and keeps DeflectLocked on 552 where the original diff put it.
+    #
+    # An earlier attempt put StaminaBonus* at 479..535 and had to be retracted: every save read a
+    # literal 7 there, which is kind u32 (0x07), i.e. a type tag. The real values are obvious once
+    # you land on them -- Hunter/Concubine/MourningKing move in multiples of 15, they only climb
+    # over a playthrough (0 -> 15 -> 60 -> 120), and they reset to 0 when a new playthrough starts.
+    # Warrior/MonsterX/Guard are 0 everywhere in this corpus, so those three are placement-by-
+    # declaration-order rather than independently witnessed changing.
     zlib.crc32(b'StateOffensiveLocked') & 0xffffffff: (541, 'B'),
     zlib.crc32(b'StateDefensiveLocked') & 0xffffffff: (542, 'B'),
     zlib.crc32(b'StateGooLocked') & 0xffffffff: (543, 'B'),
@@ -527,15 +573,100 @@ CONFIRMED_VALUE_OFFSETS = {
     zlib.crc32(b'SpecialAbilityWarriorLocked') & 0xffffffff: (557, 'B'),
     zlib.crc32(b'SpecialAbilityConcubineLocked') & 0xffffffff: (558, 'B'),
     zlib.crc32(b'SpecialAbilityAlchemistLocked') & 0xffffffff: (559, 'B'),
+    zlib.crc32(b'StaminaBonusHunter') & 0xffffffff: (560, '<I'),
+    zlib.crc32(b'StaminaBonusWarrior') & 0xffffffff: (564, '<I'),
+    zlib.crc32(b'StaminaBonusConcubine') & 0xffffffff: (568, '<I'),
+    zlib.crc32(b'StaminaBonusAlchemist') & 0xffffffff: (572, '<I'),
+    zlib.crc32(b'StaminaBonusMourningKing') & 0xffffffff: (576, '<I'),
+    zlib.crc32(b'StaminaBonusMourningKingCorrupted') & 0xffffffff: (580, '<I'),
+    zlib.crc32(b'StaminaBonusMonsterX') & 0xffffffff: (584, '<I'),
+    zlib.crc32(b'StaminaBonusGuard') & 0xffffffff: (588, '<I'),
 
-    # MissionItem.MIState -- record_offset+85, and it doesn't matter how big the record is. Most
-    # "MissionItem" matches are actually bigger MissionItemList/MissionItemSceneSequencer
-    # containers wrapping a child object, but this byte stays put regardless. Checked it against
-    # basically every MissionItem-shaped record in the save folder and it's always a small, sane
-    # value (0, 2, or 3 - matches the real enum, MIState is declared as kind=Enum in the schema).
-    # Schema says the field is 4 bytes wide but only the low byte is ever nonzero.
+    # MissionItem's 3 save-persisted fields. A plain MissionItem record is exactly 91 bytes and its
+    # values sit in a length-prefixed blob at the very end: a u32 at +81 holding 6 (== the schema's
+    # own declared widths, MIState 4 + two 1-byte bools), then the 6-byte blob at +85..+90 in
+    # declared order. The u32-6 prefix is what pins this down -- it lines up on 62535 records
+    # across the whole save folder with no exceptions, and the blob ends exactly on the record
+    # boundary.
+    #
+    # Careful with the fixed offsets: they're right for the 91-byte shape (the overwhelming
+    # majority), but plenty of "MissionItem" matches are actually bigger MissionItemList/
+    # MissionItemSceneSequencer containers wrapping a child, where the blob sits elsewhere.
+    #
+    # MIState reads 0/2/3 only, matching the real enum. Both bools, on the other hand, are 0 in
+    # every single record in the corpus -- including all 12614 where MIState is 3 (Completed),
+    # which is exactly where WasEverCompleted "should" be 1. The position is structurally certain
+    # (the length prefix leaves nowhere else for them to be); the game just never persists them as
+    # true, so it very likely rederives both from MIState on load.
     zlib.crc32(b'MIState') & 0xffffffff: (85, 'B'),
+    zlib.crc32(b'WasEverCompleted') & 0xffffffff: (89, 'B'),
+    zlib.crc32(b'WasEverPlayed') & 0xffffffff: (90, 'B'),
+
+    # PopGamePlayManager -- the per-checkpoint world state (where you are, where the camera is,
+    # how far through the act). Its value blob starts at +465 and runs in declared order, so every
+    # offset below is just the running total of the schema's own widths from there.
+    #
+    # Anchor: PrinceMatrix and LoverMatrix are 4x4 affine transforms sitting back to back, which is
+    # a shape you can spot without knowing anything else (rows 0-2 end in 0.0, row 3 ends in 1.0).
+    # That pair lands on +481 in all 66 records in the corpus, and 481 minus the 16 bytes the three
+    # fields before it declare puts the blob at 465.
+    #
+    # What makes this trustworthy rather than plausible: reading the chain back gives values that
+    # could not survive a wrong offset. CameraOrientation is a unit quaternion (|q| == 1.000 in
+    # every record), CameraFOV is 0.768 rad (44 degrees), and CameraPos lands 4-15 units from the
+    # Prince's own position -- i.e. behind a third-person camera.
+    #
+    # The chain stops at BondState: ActiveODDTags is a variable-length array, so everything
+    # declared after it (SavePrinceDeathHeight ... SaveElikaCapturedPos) has no fixed offset and is
+    # deliberately left unconfirmed. CurrentTrapSynchroZone isn't in the record at all.
+    zlib.crc32(b'TargetSectionID') & 0xffffffff: (465, '<I'),
+    zlib.crc32(b'SpecialGamePlayContext') & 0xffffffff: (477, '<I'),
+    zlib.crc32(b'SavedDivisionID') & 0xffffffff: (609, '<I'),
+    zlib.crc32(b'SavedCorruptionZoneID') & 0xffffffff: (613, '<I'),
+    zlib.crc32(b'CameraFOV') & 0xffffffff: (649, '<f'),
+    zlib.crc32(b'CurrentFightCount') & 0xffffffff: (653, '<I'),
+    zlib.crc32(b'CurrentAct') & 0xffffffff: (657, '<I'),
+    zlib.crc32(b'BondState') & 0xffffffff: (661, '<I'),
+
+    # PopSoundReverbManager -- a 51-byte record with a single declared field, and the tidiest
+    # example of the length-prefix shape in the whole file: u32 4 at +43 (matching the field's
+    # declared width) then the value at +47, running to the record boundary. Both the size and the
+    # prefix hold on all 106 records. Reads 0 in most saves and a portal-ID-looking hash otherwise.
+    zlib.crc32(b'CurrentPortalSoundReverbSetObjectID') & 0xffffffff: (47, '<I'),
 }
+
+
+# Fields whose position is confirmed but that hold several numbers rather than one, so they can't
+# go in CONFIRMED_VALUE_OFFSETS' single-scalar model. Each entry lists the components worth
+# showing, as (label, offset relative to the field, struct format).
+#
+# For the two 4x4 transforms only the translation row is listed: the other 13 floats are the
+# rotation basis, and the X/Y/Z here is the part anyone actually wants (it's where the Prince and
+# Elika are standing).
+MULTI_COMPONENT_OFFSETS = {
+    zlib.crc32(b'MousePosition') & 0xffffffff: (469, [('X', 0, '<f'), ('Y', 4, '<f')]),
+    zlib.crc32(b'PrinceMatrix') & 0xffffffff: (481, [('X', 48, '<f'), ('Y', 52, '<f'), ('Z', 56, '<f')]),
+    zlib.crc32(b'LoverMatrix') & 0xffffffff: (545, [('X', 48, '<f'), ('Y', 52, '<f'), ('Z', 56, '<f')]),
+    zlib.crc32(b'CameraPos') & 0xffffffff: (617, [('X', 0, '<f'), ('Y', 4, '<f'), ('Z', 8, '<f')]),
+    zlib.crc32(b'CameraOrientation') & 0xffffffff: (633, [('X', 0, '<f'), ('Y', 4, '<f'),
+                                                          ('Z', 8, '<f'), ('W', 12, '<f')]),
+}
+
+
+def resolve_multi_component(decompressed, record_offset, prop_hash):
+    """Component rows for a multi-number field (see MULTI_COMPONENT_OFFSETS), as
+    [(label, absolute_offset, fmt, value), ...], or None if this field isn't one of them."""
+    entry = MULTI_COMPONENT_OFFSETS.get(prop_hash)
+    if entry is None:
+        return None
+    base, comps = entry
+    out = []
+    for label, rel, fmt in comps:
+        off = record_offset + base + rel
+        if off + struct.calcsize(fmt) > len(decompressed):
+            return None
+        out.append((label, off, fmt, struct.unpack_from(fmt, decompressed, off)[0]))
+    return out
 
 
 # record[0]'s 6th property, "AchievementsTrackingData" itself, is a nested struct, not a plain
@@ -619,6 +750,17 @@ IGRAPH_RULE_TAIL_OFFSETS = {
     zlib.crc32(b'RuntimeEnabled') & 0xffffffff: (-1, 'B'),
 }
 
+_ROOT_TYPEHASH_BYTES = struct.pack('<I', ROOT_TYPEHASH)
+
+
+def true_record_end(decompressed, record_offset):
+    """Where a record really ends: the next SaveGameObject typehash at ANY alignment, or the end of
+    the buffer. enumerate_savegameobjects() only scans 4-aligned offsets, so its `size` overshoots
+    badly whenever the following record happens to start unaligned (which is common)."""
+    nxt = decompressed.find(_ROOT_TYPEHASH_BYTES, record_offset + 25)
+    return len(decompressed) if nxt == -1 else nxt
+
+
 # (tail_offsets_table, max_size) pairs, checked in order by resolve_property_value_slot -- add new
 # "value lives near the end of the record" shapes here instead of writing another branch by hand.
 _TAIL_OFFSET_TABLES = (
@@ -627,8 +769,37 @@ _TAIL_OFFSET_TABLES = (
     (IGRAPH_RULE_TAIL_OFFSETS, IGRAPH_RULE_MAX_SIZE),
 )
 
+# Fallback for SectionGameData records that the tail rule can't touch: some are hundreds of bytes
+# long (the 4 fields are still the whole declared set, but the record carries a lot else), so
+# "last 16 bytes" doesn't apply. Those still carry the same length-prefixed blob every other class
+# uses, so find it by its u32 = 16 header instead of by position.
+#
+# Only worth doing for a blob length distinctive enough not to match noise -- 16 is, a 1-byte blob
+# (CorruptionZone/IGraphRule) very much isn't, so those keep the tail rule only. Checked against
+# the records where BOTH rules apply: same offset on 2187 of 2188, and the tail rule is tried
+# first, so that one disagreement never actually reaches this path.
+SECTION_GAME_DATA_BLOB_LEN = 16
+SECTION_GAME_DATA_BLOB_FIELDS = {
+    zlib.crc32(b'NbTimeVisited') & 0xffffffff: (0, '<I'),
+    zlib.crc32(b'NbSparklesCollected') & 0xffffffff: (4, '<I'),
+    zlib.crc32(b'FertileGroundStatus') & 0xffffffff: (8, '<I'),
+    zlib.crc32(b'NbFightsDone') & 0xffffffff: (12, '<I'),
+}
 
-def resolve_property_value_slot(decompressed, record_offset, prop_hash, record_size=None):
+
+def _find_length_prefixed_blob(decompressed, search_from, blob_len, limit):
+    """Start of a value blob introduced by a u32 == blob_len, or None. Scans forward from
+    `search_from` (pass the end of the name table -- searching the header would match noise)."""
+    p = search_from
+    while p + 4 + blob_len <= limit:
+        if struct.unpack_from('<I', decompressed, p)[0] == blob_len:
+            return p + 4
+        p += 1
+    return None
+
+
+def resolve_property_value_slot(decompressed, record_offset, prop_hash, record_size=None,
+                                 name_table_end=None):
     """Where decode_property_value's confirmed-offset lookup would read from, without actually
     reading it -- (absolute_byte_offset, struct_format) or None. Split out from
     decode_property_value so save_explorer.py's edit-value feature can write to the exact same
@@ -640,22 +811,40 @@ def resolve_property_value_slot(decompressed, record_offset, prop_hash, record_s
         if off + struct.calcsize(fmt) > len(decompressed):
             return None
         return off, fmt
-    if record_size is not None:
-        for table, max_size in _TAIL_OFFSET_TABLES:
-            tail_entry = table.get(prop_hash)
-            if tail_entry is not None and record_size <= max_size:
-                tail_rel, fmt = tail_entry
-                off = record_offset + record_size + tail_rel
-                if 0 <= off <= len(decompressed) - struct.calcsize(fmt):
-                    return off, fmt
+    for table, max_size in _TAIL_OFFSET_TABLES:
+        tail_entry = table.get(prop_hash)
+        if tail_entry is None:
+            continue
+        tail_rel, fmt = tail_entry
+        # Try the caller's size first, then the record's real end. enumerate_savegameobjects()
+        # measures to the next 4-ALIGNED typehash, so a record followed by an unaligned one gets
+        # reported far too big and fails the size gate below -- true_record_end() doesn't care
+        # about alignment and recovers those.
+        for size in (record_size, true_record_end(decompressed, record_offset) - record_offset):
+            if size is None or not (0 < size <= max_size):
+                continue
+            off = record_offset + size + tail_rel
+            if 0 <= off <= len(decompressed) - struct.calcsize(fmt):
+                return off, fmt
+    blob_entry = SECTION_GAME_DATA_BLOB_FIELDS.get(prop_hash)
+    if blob_entry is not None and name_table_end is not None:
+        rel, fmt = blob_entry
+        start = _find_length_prefixed_blob(decompressed, name_table_end, SECTION_GAME_DATA_BLOB_LEN,
+                                            true_record_end(decompressed, record_offset))
+        if start is not None:
+            off = start + rel
+            if 0 <= off <= len(decompressed) - struct.calcsize(fmt):
+                return off, fmt
     return None
 
 
-def decode_property_value(decompressed, record_offset, prop_hash, record_size=None):
+def decode_property_value(decompressed, record_offset, prop_hash, record_size=None,
+                          name_table_end=None):
     """Return a decoded value for a property if its byte position is confirmed (see
     resolve_property_value_slot), else None -- callers should show something honest (not a guess)
     when this returns None."""
-    slot = resolve_property_value_slot(decompressed, record_offset, prop_hash, record_size=record_size)
+    slot = resolve_property_value_slot(decompressed, record_offset, prop_hash,
+                                        record_size=record_size, name_table_end=name_table_end)
     if slot is None:
         return None
     off, fmt = slot
@@ -692,6 +881,37 @@ def enum_name(field_name, value):
     if table is None:
         return None
     return table.get(value)
+
+
+# Names save_schema.py patches to a 1-byte width itself -- that patch leaves them looking like
+# kind 0, but they're a 0-255 brightness slider, not flags. Keep them out of the bool set.
+_NOT_REALLY_BOOL = frozenset(('Brightness', 'BrightnessDefault'))
+
+_BOOL_FIELDS = None
+
+
+def bool_field_names():
+    """Field names the schema declares as a 1-byte bool (kind 0) everywhere they appear.
+
+    Requiring *every* declaration of a name to be kind 0 is deliberate: a name declared bool on one
+    class and something wider on another (Brightness is the real example) isn't safely a bool, and
+    a field the editor wrongly treats as one would silently clamp a real value to 0/1."""
+    global _BOOL_FIELDS
+    if _BOOL_FIELDS is not None:
+        return _BOOL_FIELDS
+    kinds = {}
+    for cls, fields in full_schema_census().items():
+        for nm, kind, w in fields:
+            kinds.setdefault(nm, set()).add(kind)
+    _BOOL_FIELDS = frozenset(nm for nm, ks in kinds.items()
+                             if ks == {0} and nm not in _NOT_REALLY_BOOL)
+    return _BOOL_FIELDS
+
+
+def is_bool_field(field_name):
+    """True if this field is a plain true/false flag -- lets the editor offer a false/true choice
+    instead of a free-text byte box that would happily accept 255."""
+    return field_name in bool_field_names()
 
 
 # A SaveGameObject's `uid` is the same hash-of-the-instance-name scheme used for every resource's

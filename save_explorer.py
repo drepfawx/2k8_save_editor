@@ -8,7 +8,6 @@ needed to list). Right pane: full structural breakdown of the selected save --
                strings), ground-truthed against PrinceOfPersia_Launchera.exe's writer+loader.
   Checkpoint   blob2's checkpoint-ID + level name (the small record the save browser itself
                reads without touching the big blob).
-  Screenshot   the trailer PNG, rendered inline (Tk 8.6 loads PNG natively).
   Game State   blob1, decompressed (see pop_save.py's docstring). Root type is SaveGameObject;
                full field-level decode isn't cracked yet, so this shows what's known
                (typehash/declared size) plus a raw hex dump of the decompressed bytes rather than
@@ -110,7 +109,6 @@ class SaveExplorer(tk.Tk):
         filemenu.add_command(label='Open save folder...', command=self.open_folder_dialog)
         filemenu.add_separator()
         filemenu.add_command(label='Export decompressed blob1...', command=self.export_blob1)
-        filemenu.add_command(label='Export screenshot...', command=self.export_screenshot)
         filemenu.add_separator()
         filemenu.add_command(label='Exit', command=self.destroy)
         menubar.add_cascade(label='File', menu=filemenu)
@@ -190,9 +188,6 @@ class SaveExplorer(tk.Tk):
 
         bottom = ttk.Frame(right)
         bottom.pack(fill=tk.BOTH, expand=False, side=tk.BOTTOM)
-
-        self.screenshot_label = ttk.Label(bottom, text='(select a save to preview its screenshot)')
-        self.screenshot_label.pack(side=tk.LEFT, padx=6, pady=6)
 
         self.hexbox = tk.Text(bottom, height=16, wrap='none', font=('Consolas', 9))
         self.hexbox.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -381,8 +376,18 @@ class SaveExplorer(tk.Tk):
         if val is not None:
             if isinstance(val, float):
                 return '%.4f' % val
+            elif isinstance(val, int) and PS.is_bool_field(prop_name):
+                # Anything other than 0/1 is worth showing loudly rather than calling it true.
+                return {0: 'false (0)', 1: 'true (1)'}.get(val, '%d (unexpected for a bool)' % val)
             elif prop_name.endswith('ID'):
-                return '%#010x' % val
+                # These hold the same instance-name hash the .forge resource tables use, so the
+                # offline name cache turns them into the real thing ("DE3_Terrace" rather than
+                # 0xd220800e). Every nonzero ID in the corpus resolves; keep the raw hex alongside
+                # it since that's what's actually in the file.
+                if val == 0:
+                    return '0 (none)'
+                name = PS.resolve_instance_name(val)
+                return '%s (%#010x)' % (name, val) if name else '%#010x' % val
             else:
                 return str(val)
         if prop_name.startswith('0x'):
@@ -399,13 +404,33 @@ class SaveExplorer(tk.Tk):
         something) are registered in self._editable so double-clicking the Value cell can edit
         them in place -- see on_tree_double_click/_open_edit_dialog."""
         for prop in ptab['properties']:
-            val = PS.decode_property_value(dec, offset, prop['hash'], record_size=record_size)
+            nte = ptab.get('name_table_end')
+            val = PS.decode_property_value(dec, offset, prop['hash'], record_size=record_size,
+                                            name_table_end=nte)
+            comps = PS.resolve_multi_component(dec, offset, prop['hash'])
+            nested = (PS.decode_achievements_tracking_data(dec, offset)
+                      if prop['name'] == 'AchievementsTrackingData' else None)
             shown = self._format_property_value(prop['name'], val)
+            if val is None and comps:
+                # A vector/quaternion/transform: the row itself summarises, the editable numbers
+                # go on the child rows below it.
+                shown = ', '.join('%s=%.3f' % (lbl, v) for lbl, _o, _f, v in comps)
+            elif val is None and nested:
+                # A struct has no value of its own -- the real numbers are on the child rows, so
+                # leave the Value column empty rather than putting a label where a value goes.
+                shown = ''
             iid = self.detail_tree.insert(node, tk.END, text='  ' + prop['name'], values=(shown,))
-            slot = PS.resolve_property_value_slot(dec, offset, prop['hash'], record_size=record_size)
+            slot = PS.resolve_property_value_slot(dec, offset, prop['hash'],
+                                                   record_size=record_size, name_table_end=nte)
             if slot is not None:
                 off, fmt = slot
                 self._editable[iid] = dict(kind='property', offset=off, fmt=fmt, prop_name=prop['name'])
+            elif comps:
+                for lbl, coff, cfmt, cval in comps:
+                    ciid = self.detail_tree.insert(iid, tk.END, text='    ' + lbl,
+                                                    values=('%.4f' % cval,))
+                    self._editable[ciid] = dict(kind='property', offset=coff, fmt=cfmt,
+                                                 prop_name='%s.%s' % (prop['name'], lbl))
             if prop['name'] == 'AchievementsTrackingData':
                 self._insert_achievements_tracking_data(iid, dec, offset)
 
@@ -446,6 +471,9 @@ class SaveExplorer(tk.Tk):
         off = meta['offset']
         cur = struct.unpack_from(fmt, dec, off)[0]
         enum_table = PS.ENUM_NAMES.get(prop_name)
+        # Bools get the same readonly-dropdown treatment as enums -- a free-text byte box would
+        # accept 255 for a field the game only ever writes 0 or 1 to.
+        is_bool = enum_table is None and PS.is_bool_field(prop_name)
 
         dlg = tk.Toplevel(self)
         dlg.title('Edit %s' % prop_name)
@@ -461,6 +489,18 @@ class SaveExplorer(tk.Tk):
                                 values=[nm for _v, nm in options], width=36)
             box.pack(padx=10, pady=4)
             by_name = {nm: v for v, nm in options}
+
+            def get_value():
+                return by_name[var.get()]
+        elif is_bool:
+            options = [(0, '0 - false'), (1, '1 - true')]
+            by_name = {nm: v for v, nm in options}
+            # An out-of-range byte already on disk still shows as-is rather than being silently
+            # rounded to a lie; picking from the list is what normalises it back to 0/1.
+            var = tk.StringVar(value=dict(options).get(cur, '%d - (unexpected)' % cur))
+            box = ttk.Combobox(dlg, textvariable=var, state='readonly',
+                                values=[nm for _v, nm in options], width=36)
+            box.pack(padx=10, pady=4)
 
             def get_value():
                 return by_name[var.get()]
@@ -624,22 +664,6 @@ class SaveExplorer(tk.Tk):
         self.detail_tree.insert(cp, tk.END, text='marker', values=(sf.blob2['marker'],))
         self.detail_tree.insert(cp, tk.END, text='raw size', values=(len(sf.blob2['raw']),))
 
-        ss = self.detail_tree.insert('', tk.END, text='Screenshot (trailer)', open=True)
-        self.detail_tree.insert(ss, tk.END, text='PNG size', values=(len(sf.trailer_png),))
-
-        pp = self.detail_tree.insert('', tk.END, text='Property Paths (whole-file scan)', open=False)
-        dec_for_scan = sf.decompressed_blob1
-        if dec_for_scan is not None:
-            pairs = PS.scan_property_paths(dec_for_scan)
-            by_class = {}
-            for (cls, fld), cnt in pairs.items():
-                by_class.setdefault(cls, []).append((fld, cnt))
-            for cls in sorted(by_class):
-                cls_node = self.detail_tree.insert(pp, tk.END, text=cls)
-                for fld, cnt in sorted(by_class[cls]):
-                    self.detail_tree.insert(cls_node, tk.END, text='  ' + fld,
-                                             values=('seen %d times' % cnt,))
-
         # Save-persisted field census, straight from POP0.schema's own 0x08000000 flag bit -- a
         # static, whole-game reference (same for every save file). Every class/field here is
         # something the engine can persist to a save; not all of them will actually appear as a
@@ -705,18 +729,6 @@ class SaveExplorer(tk.Tk):
                 if ptab:
                     self._insert_property_children(rec_node, dec, e['offset'], ptab)
 
-        # screenshot preview
-        try:
-            self._photo = tk.PhotoImage(data=sf.trailer_png)
-            # downscale if huge, keep it simple: Tk subsample only supports integer factors
-            w = self._photo.width()
-            if w > 220:
-                factor = max(1, w // 220)
-                self._photo = self._photo.subsample(factor, factor)
-            self.screenshot_label.config(image=self._photo, text='')
-        except Exception:
-            self.screenshot_label.config(image='', text='(screenshot preview failed)')
-
         self._show_hex(dec if dec is not None else b'')
         self.status.config(text=os.path.basename(sf.path))
 
@@ -757,16 +769,6 @@ class SaveExplorer(tk.Tk):
         if out:
             open(out, 'wb').write(self.current.decompressed_blob1)
             self.status.config(text='wrote ' + out)
-
-    def export_screenshot(self):
-        if not self.current:
-            return
-        out = filedialog.asksaveasfilename(defaultextension='.png',
-                                            initialfile=os.path.basename(self.current.path) + '.png')
-        if out:
-            open(out, 'wb').write(self.current.trailer_png)
-            self.status.config(text='wrote ' + out)
-
 
 def main():
     start = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SAVE_DIR
