@@ -376,6 +376,10 @@ class SaveExplorer(tk.Tk):
         if val is not None:
             if isinstance(val, float):
                 return '%.4f' % val
+            elif isinstance(val, int) and prop_name in PS.BITMASK_FIELDS:
+                # A bit set, not a number -- hex shows the structure and the count says how many
+                # are actually set, which is the part anyone cares about.
+                return '%#018x (%d bits set)' % (val, bin(val).count('1'))
             elif isinstance(val, int) and PS.is_bool_field(prop_name):
                 # Anything other than 0/1 is worth showing loudly rather than calling it true.
                 return {0: 'false (0)', 1: 'true (1)'}.get(val, '%d (unexpected for a bool)' % val)
@@ -410,11 +414,16 @@ class SaveExplorer(tk.Tk):
             comps = PS.resolve_multi_component(dec, offset, prop['hash'])
             nested = (PS.decode_achievements_tracking_data(dec, offset)
                       if prop['name'] == 'AchievementsTrackingData' else None)
+            arr = PS.active_odd_tags(dec, offset, prop['hash'])
             shown = self._format_property_value(prop['name'], val)
             if val is None and comps:
                 # A vector/quaternion/transform: the row itself summarises, the editable numbers
                 # go on the child rows below it.
                 shown = ', '.join('%s=%.3f' % (lbl, v) for lbl, _o, _f, v in comps)
+            elif val is None and arr is not None:
+                # Its length is what positions every field after it, so show the count rather than
+                # calling the whole array unconfirmed.
+                shown = '(array, %d entries)' % arr[0]
             elif val is None and nested:
                 # A struct has no value of its own -- the real numbers are on the child rows, so
                 # leave the Value column empty rather than putting a label where a value goes.
@@ -505,7 +514,10 @@ class SaveExplorer(tk.Tk):
             def get_value():
                 return by_name[var.get()]
         else:
-            var = tk.StringVar(value=str(cur))
+            # Bit sets prefill as hex -- editing one in decimal is hopeless. get_value() parses
+            # with base 0, so the hex comes straight back in.
+            initial = ('%#018x' % cur) if prop_name in PS.BITMASK_FIELDS else str(cur)
+            var = tk.StringVar(value=initial)
             entry = ttk.Entry(dlg, textvariable=var, width=24)
             entry.pack(padx=10, pady=4)
             entry.select_range(0, tk.END)
@@ -685,29 +697,94 @@ class SaveExplorer(tk.Tk):
             objs = PS.enumerate_savegameobjects(dec)
             self._sgo_objs = objs
             self._sgo_dec = dec
+            # MissionItems get their own section below, walked as a proper 91-byte chain. Drop
+            # every one the aligned scan happens to land on, not just the 364-byte spans: a run
+            # only measures 364 when the next aligned typehash is exactly 4 records away, so the
+            # last record of a run turns up with an arbitrary size instead.
+            others = [o for o in objs
+                      if not PS.is_mission_item(dec, o['offset'])
+                      and not PS.is_section_game_data(dec, o['offset'])]
             arr = self.detail_tree.insert(
-                gs, tk.END, text='SaveGameObject array (%d instances)' % len(objs), open=False)
-            for i, o in enumerate(objs):
+                gs, tk.END, text='SaveGameObject array (%d instances)' % len(others), open=False)
+            for i, o in enumerate(others):
                 node, ptab = self._insert_record_row(
                     arr, dec, iid='sgo_%d' % i, index=i, offset=o['offset'], uid=o['uid'],
                     kind=o['kind'], size=o['size'], tag='sgo')
                 if ptab:
                     self._insert_property_children(node, dec, o['offset'], ptab, record_size=o['size'])
-                elif o['size'] == 364:
-                    slots = PS.read_slots(dec, o['offset'])
-                    if slots:
-                        for si, s in enumerate(slots):
-                            slot_name = PS.resolve_instance_name(s['uid'])
-                            field = 'slot %d%s' % (si, (' %s' % slot_name) if slot_name else '')
-                            slot_iid = self.detail_tree.insert(node, tk.END, text='  ' + field, values=(s['state'],))
-                            # offset is confirmed (state byte @ local+85 within each 91-byte
-                            # sub-block) even though its semantic meaning isn't -- still safe to
-                            # make editable.
-                            self._editable[slot_iid] = dict(
-                                kind='slot', offset=o['offset'] + si * 91 + 85, fmt='B', prop_name=field)
-            note = self.detail_tree.insert(
-                gs, tk.END, text='(per-instance field decode)',
-                values=('not fully cracked yet -- see pop_save.py docstring; click an instance to hex-dump it',))
+
+            # Every MissionItem, walked as a 91-byte chain rather than inferred from alignment.
+            items = PS.find_mission_items(dec)
+            mi = self.detail_tree.insert(
+                gs, tk.END, text='Mission items (%d)' % len(items), open=False)
+            for j, it in enumerate(items):
+                name = PS.resolve_instance_name(it['uid']) or '%#010x' % it['uid']
+                # The record row identifies the instance; its three fields go underneath, so
+                # MIState reads as a named field like every other one instead of being the row's
+                # own "value".
+                iid = self.detail_tree.insert(
+                    mi, tk.END, text='  ' + name,
+                    values=('', 'MissionItem', '%#010x' % it['uid'], '%#x' % it['offset'],
+                            '%d B' % PS.MISSION_ITEM_SIZE, 'chain'))
+                for lbl, rel in (('MIState', 85), ('WasEverCompleted', 89), ('WasEverPlayed', 90)):
+                    ciid = self.detail_tree.insert(
+                        iid, tk.END, text='    ' + lbl,
+                        values=(self._format_property_value(lbl, dec[it['offset'] + rel]),))
+                    self._editable[ciid] = dict(kind='property', offset=it['offset'] + rel,
+                                                 fmt='B', prop_name=lbl)
+
+            # Per-region trackers: light seeds collected per area (the numbers the in-game map
+            # shows), visits, fights, and whether the fertile ground is healed. Found by signature
+            # for the same reason as MissionItem -- most sit at unaligned offsets.
+            regions = []
+            for r in PS.find_section_game_data(dec):
+                nm = (PS.resolve_instance_name(r['uid']) or '%#010x' % r['uid'])
+                nm = nm.replace('(SectionGameData) ', '')
+                # "_FAKE" regions are the reduced streaming variants. They're real records with
+                # real data, they just never accumulate anything -- 0 seeds in all 2280 seen -- so
+                # they're listed but kept out of the total and sorted to the bottom.
+                regions.append((nm, '_FAKE' in nm, r))
+            live = [r for nm, fake, r in regions if r['initialized'] and not fake]
+            total = sum(r['NbSparklesCollected'] for r in live)
+            unloaded = sum(1 for nm, fake, r in regions if not r['initialized'])
+            fakes = sum(1 for nm, fake, r in regions if fake)
+            label = 'Region trackers (%d regions, %d light seeds)' % (len(live), total)
+            extra = ([('%d never loaded' % unloaded) if unloaded else ''] +
+                     [('%d streaming variants' % fakes) if fakes else ''])
+            extra = [e for e in extra if e]
+            if extra:
+                label += ' -- ' + ', '.join(extra)
+            reg = self.detail_tree.insert(gs, tk.END, open=False, text=label)
+            # The 24 seed-bearing regions come first, always in the same fixed order (area, then
+            # 1-6) rather than sorted by count -- so a region stays put as you collect. Everything
+            # else follows alphabetically, with never-loaded records and streaming variants last.
+            def _order(t):
+                nm, fake, r = t
+                rank = PS.seed_region_rank(nm)
+                if fake or not r['initialized'] or rank is None:
+                    return (1, 1 if fake else 0, 0 if r['initialized'] else 1, 0, nm.lower())
+                return (0, 0, 0, rank, '')
+            for nm, fake, r in sorted(regions, key=_order):
+                if fake:
+                    note = '(streaming variant)'
+                elif not r['initialized']:
+                    note = '(never loaded -- values uninitialised)'
+                else:
+                    note = ''
+                riid = self.detail_tree.insert(
+                    reg, tk.END, text='  ' + nm,
+                    values=(note, 'SectionGameData', '%#010x' % r['uid'],
+                            '%#x' % r['offset'], '', 'chain'))
+                if not r['initialized']:
+                    continue    # the numbers underneath would be leftover memory, not save data
+                for k, lbl in enumerate(('NbTimeVisited', 'NbSparklesCollected',
+                                          'FertileGroundStatus', 'NbFightsDone')):
+                    off = r['blob_offset'] + k * 4
+                    ciid = self.detail_tree.insert(
+                        riid, tk.END, text='    ' + lbl,
+                        values=(self._format_property_value(lbl, r[lbl]),))
+                    self._editable[ciid] = dict(kind='property', offset=off, fmt='<I',
+                                                 prop_name=lbl)
 
             # Records enumerate_savegameobjects() structurally can't see (non-4-byte-aligned
             # typehash) -- found via a separate, narrowly-targeted class-signature lookup instead

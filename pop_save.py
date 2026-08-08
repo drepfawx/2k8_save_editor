@@ -22,6 +22,7 @@ bytes and root typehash so callers can show what's known and fall back to raw he
 save_explorer.py.
 """
 import os
+import re
 import struct
 import sys
 import zlib
@@ -314,6 +315,161 @@ def enumerate_savegameobjects(decompressed):
     return out
 
 
+# A MissionItem record is exactly 91 bytes, and they're stored back to back in runs of whatever
+# length the level needs (1 to 41 in this corpus).
+#
+# This is worth spelling out because it produced a long-lived wrong conclusion. 91 isn't a multiple
+# of 4, so LCM(91, 4) = 364: starting from a 4-aligned MissionItem, the next 4-aligned one is
+# exactly 364 bytes later. enumerate_savegameobjects() only looks at 4-aligned offsets, so it saw
+# "a 364-byte record every 364 bytes" and that got read as one CompositeSaveGameObject holding 4
+# children. It isn't -- those 4 are just consecutive, unrelated entries that happen to span the
+# alignment period, which is why a "group" would contain e.g. HC3_LAIR next to PowerTutorial_Dash.
+#
+# The giveaway: 7574 of 8936 supposed groups have another MissionItem 91 bytes BEFORE them, i.e.
+# they start mid-run. A real 4-element group could never do that. Walking the chain properly finds
+# 74538 records where the grouped view accounted for 35744.
+MISSION_ITEM_SIZE = 91
+_MISSION_ITEM_FIELD_HASHES = [zlib.crc32(x) & 0xffffffff
+                              for x in (b'MIState', b'WasEverCompleted', b'WasEverPlayed')]
+
+
+def is_mission_item(decompressed, offset):
+    """True if a whole 91-byte MissionItem record starts here. Checks the typehash, the declared
+    field count, all three name-table hashes at their 11-byte stride, and the value blob's own
+    length prefix -- five independent things, so it doesn't fire on lookalike bytes."""
+    if offset < 0 or offset + MISSION_ITEM_SIZE > len(decompressed):
+        return False
+    if struct.unpack_from('<I', decompressed, offset)[0] != ROOT_TYPEHASH:
+        return False
+    if struct.unpack_from('<I', decompressed, offset + 16)[0] != 3:
+        return False
+    for i, h in enumerate(_MISSION_ITEM_FIELD_HASHES):
+        if struct.unpack_from('<I', decompressed, offset + 25 + 11 * i)[0] != h:
+            return False
+    return struct.unpack_from('<I', decompressed, offset + 81)[0] == 6
+
+
+def find_mission_items(decompressed):
+    """Every MissionItem record in the buffer, in file order, regardless of alignment. Returns
+    dicts of (offset, uid, state, was_ever_completed, was_ever_played)."""
+    out = []
+    p = 0
+    n = len(decompressed)
+    while p < n - MISSION_ITEM_SIZE:
+        if is_mission_item(decompressed, p):
+            while is_mission_item(decompressed, p):
+                out.append(dict(offset=p,
+                                uid=struct.unpack_from('<I', decompressed, p + 4)[0],
+                                state=decompressed[p + 85],
+                                was_ever_completed=decompressed[p + 89],
+                                was_ever_played=decompressed[p + 90]))
+                p += MISSION_ITEM_SIZE
+        else:
+            p += 1
+    return out
+
+
+# Per-region progress trackers -- this is where the game keeps light seeds collected *per area*,
+# the numbers the in-game map shows, as opposed to PopGameplaySettings.SparkleCount which is the
+# single running total.
+#
+# Same alignment trap as MissionItem: these records sit right after 91-byte MissionItem runs, so
+# most of them start at a non-4-aligned offset and the aligned scanner never sees them (2695 of
+# 3236 in a 20-save sample). Found by signature instead.
+_SECTION_GAME_DATA_FIELDS = [b'NbTimeVisited', b'NbSparklesCollected',
+                             b'FertileGroundStatus', b'NbFightsDone']
+_SECTION_GAME_DATA_HASHES = [zlib.crc32(x) & 0xffffffff for x in _SECTION_GAME_DATA_FIELDS]
+
+
+def is_section_game_data(decompressed, offset):
+    """True if a SectionGameData record starts here (typehash, field count of 4, and all four
+    name-table hashes at their 11-byte stride)."""
+    if offset < 0 or offset + 110 > len(decompressed):
+        return False
+    if struct.unpack_from('<I', decompressed, offset)[0] != ROOT_TYPEHASH:
+        return False
+    if struct.unpack_from('<I', decompressed, offset + 16)[0] != 4:
+        return False
+    return [struct.unpack_from('<I', decompressed, offset + 25 + 11 * i)[0]
+            for i in range(4)] == _SECTION_GAME_DATA_HASHES
+
+
+# The blob's length prefix sits at a fixed +100 in 17270 of 17303 records, so there's no need to
+# go looking for it. Don't anchor to the record's end instead: record length isn't constant (120 is
+# usual, but DE1_D runs 128 with 8 trailing zero bytes), and end-anchoring silently shifts the blob
+# on any record that has a tail.
+SECTION_GAME_DATA_BLOB_PREFIX_OFFSET = 100
+
+# A region holds at most 45 light seeds (25 in the four LAIR regions) -- taken from a 100%-collected
+# save where 20 regions x 45 + 4 lairs x 25 came to exactly the 1000 in SparkleCount. So anything
+# above 45 is impossible rather than merely surprising, and marks a record the game never wrote.
+MAX_SPARKLES_PER_REGION = 45
+
+
+# The 24 regions that actually hold light seeds: four areas of six regions each, which is exactly
+# how the game lays them out. Their tracker names are AREA + a single digit 1-6 + underscore
+# ("HC1_LeftTower", "RC3_Arena_LAIR"); the two-digit ones ("HC25_RockyCliff") are the corridors
+# between regions and never hold seeds. Verified on a 100%-collected save: the pattern matches
+# exactly 24 records, and no region outside it holds a single seed.
+#
+# Position 3 of every area is the boss lair, which caps at 25 seeds instead of 45.
+SEED_REGION_AREAS = ('HC', 'LR', 'OB', 'RC')
+_SEED_REGION_RE = re.compile(r'^(HC|LR|OB|RC)([1-6])_')
+
+
+def seed_region_rank(region_name):
+    """Fixed display position 0-23 for a seed-bearing region, or None if it isn't one. Deliberately
+    independent of how many seeds are currently collected, so the list stays in the same order from
+    a fresh save to a finished one."""
+    m = _SEED_REGION_RE.match(region_name)
+    if not m:
+        return None
+    return SEED_REGION_AREAS.index(m.group(1)) * 6 + int(m.group(2)) - 1
+
+
+def _section_game_data_blob(decompressed, record_offset, limit):
+    """Start of a SectionGameData record's 16-byte value blob, or None."""
+    off = record_offset + SECTION_GAME_DATA_BLOB_PREFIX_OFFSET
+    if (off + 4 + SECTION_GAME_DATA_BLOB_LEN <= len(decompressed)
+            and struct.unpack_from('<I', decompressed, off)[0] == SECTION_GAME_DATA_BLOB_LEN):
+        return off + 4
+    return _find_length_prefixed_blob(decompressed, record_offset + 69,
+                                       SECTION_GAME_DATA_BLOB_LEN, min(record_offset + 220, limit))
+
+
+def find_section_game_data(decompressed):
+    """Every region tracker in the buffer, regardless of alignment. Returns dicts of (offset, uid,
+    blob_offset, NbTimeVisited, NbSparklesCollected, FertileGroundStatus, NbFightsDone).
+
+    Each record carries `initialized`. A region the player never loaded still gets a record, but
+    the game never fills its value blob in, so it reads as whatever was in memory -- millions of
+    light seeds, a visit count that's really a float bit pattern. Those are flagged rather than
+    dropped (the record genuinely exists, and hiding it would be its own kind of lie) and callers
+    should leave them out of any total.
+
+    FertileGroundStatus is the other gate: it's a 3-member enum, so a record whose blob was located
+    wrongly gets dropped instead of reported with junk numbers."""
+    out = []
+    n = len(decompressed)
+    p = 0
+    while p < n - 110:
+        if not is_section_game_data(decompressed, p):
+            p += 1
+            continue
+        name_table_end = p + 25 + 4 * 11
+        start = _section_game_data_blob(decompressed, p, n)
+        if start is not None:
+            visits, sparkles, fertile, fights = struct.unpack_from('<4I', decompressed, start)
+            if fertile <= 2:
+                out.append(dict(offset=p, uid=struct.unpack_from('<I', decompressed, p + 4)[0],
+                                blob_offset=start, NbTimeVisited=visits,
+                                NbSparklesCollected=sparkles, FertileGroundStatus=fertile,
+                                NbFightsDone=fights,
+                                initialized=sparkles <= MAX_SPARKLES_PER_REGION))
+        p += MISSION_ITEM_SIZE
+    return out
+
+
 def find_unaligned_records(decompressed):
     """Narrowly-targeted lookup for census-class records that enumerate_savegameobjects() misses
     because their typehash sits at a non-4-byte-aligned offset. For each class in
@@ -472,10 +628,13 @@ def read_property_table(decompressed, record_offset, record_size=None):
     HEADER = 25
     NAME_REC = 11
     if record_size == 364:
-        # CompositeSaveGameObject.SavedObjects shape (4 nested 91-byte children, see read_slots())
-        # -- its shared static template happens to contain a few byte sequences that coincidentally
-        # equal real name hashes (MIState, WasEverCompleted, ...), producing a convincing-looking
-        # but wrong property table without this check.
+        # CompositeSaveGameObject.SavedObjects shape (4 nested 91-byte children, see read_slots()).
+        # Reading it as one flat table would splice four separate records together.
+        #
+        # The MIState/WasEverCompleted/WasEverPlayed hashes visible in here were once written off as
+        # coincidence; they aren't. Each child is a genuine MissionItem record -- same field count,
+        # same name table, same 6-byte value blob -- confirmed on 35741 of 35744 children across the
+        # corpus. The guard is still right, just not for the reason first assumed.
         return None
     if record_offset + HEADER > len(decompressed):
         return None
@@ -523,7 +682,8 @@ def names_lookup(h):
 CONFIRMED_VALUE_OFFSETS = {
     # record[0]'s 5 simple properties, packed back to back as 4-byte slots starting at 473.
     #   CurrentPopGameStage @473 - jumps 0->3 right when you first reach The Cauldron, then holds.
-    #     Coarse chapter/stage enum.
+    #     Story-progression enum, and the member names back the reading up: 3 is
+    #     HealingFertileGrounds, which is exactly what starts there (see ENUM_NAMES).
     #   NumberCompletedFight @477 - small counter, barely moves. Fight count.
     #   SparkleCount @481 - climbs steadily. Collectible count.
     #   LastPopEnvironmentAreaPortalID @485 - not a counter, but the same value shows up again
@@ -653,20 +813,103 @@ MULTI_COMPONENT_OFFSETS = {
 }
 
 
+# Everything above sits at a fixed offset because every field before it has a fixed width. That
+# stops at ActiveODDTags: it's an array, stored as [u32 count][count x u32] starting at +665, so
+# the nine fields after it slide by 4 bytes per entry. Counts really do vary (1, 3, 4, 9, 22, 95,
+# 199 all show up), which is why these were the last fields left unplaced.
+#
+# The fix is to stop guessing the record's end and derive it: read the count, skip the array, and
+# the remaining 75 bytes are the tail. Scanning for the next record's typehash does NOT work here
+# -- that byte pattern turns up inside the array data and the matrix, and truncated 60 of 66
+# records when tried.
+#
+# Validation: with the tail placed this way, all seven bools read strictly 0/1 across every record,
+# SavePrinceDeathHeightValue is a clean 25.0 or 10.0, and SaveElikaCapturedPos is either all zeros
+# (Elika not captured) or a well-formed affine transform. Placed even one byte off, none of that
+# holds.
+# What the tags are: the exe's class list has ODDConversation (ConversationID, Played,
+# ODDDialogLineList), ODDDialogLine (CharacterSpeaking, OasisLineID, LookAt, FingerPointing), and
+# both ODDEvent and ODDComponent declare a field called literally ODDTag. So this is the contextual
+# Prince/Elika banter system, and ActiveODDTags is the set of dialogue triggers currently live.
+# (The acronym is a guess -- "on-demand dialogue" fits -- but what the system DOES isn't.)
+#
+# The data agrees: 261 distinct tags across the corpus, arrays running from 1 entry in a fresh save
+# to 223 late on, correlating with playtime at 0.86 and climbing alongside CurrentAct and BondState.
+# The tag values are hashes that match neither the forge instance-name registry nor the schema name
+# table, so there's no name to show for them yet -- hence the row reports a count instead.
+ACTIVE_ODD_TAGS_COUNT_OFFSET = 665
+_POP_GPM_TAIL_LEN = 75
+
+
+def popgameplaymanager_tail_start(decompressed, record_offset):
+    """Absolute offset of the fields that follow PopGamePlayManager's ActiveODDTags array, or None
+    if the count doesn't look sane. Callers must already know this record is a PopGamePlayManager
+    (the field-name hashes below are unique to it)."""
+    off = record_offset + ACTIVE_ODD_TAGS_COUNT_OFFSET
+    if off + 4 > len(decompressed):
+        return None
+    count = struct.unpack_from('<I', decompressed, off)[0]
+    if not (0 <= count <= 4096):
+        return None
+    start = off + 4 + 4 * count
+    if start + _POP_GPM_TAIL_LEN > len(decompressed):
+        return None
+    return start
+
+
+# Offsets within that tail.
+POP_GPM_TAIL_OFFSETS = {
+    zlib.crc32(b'SavePrinceDeathHeight') & 0xffffffff: (0, 'B'),
+    zlib.crc32(b'SavePrinceDeathHeightValue') & 0xffffffff: (1, '<f'),
+    zlib.crc32(b'SaveElikaFollowUpActive') & 0xffffffff: (5, 'B'),
+    zlib.crc32(b'SaveElikaActionCoopJump') & 0xffffffff: (6, 'B'),
+    zlib.crc32(b'SaveElikaActionMagicPlate') & 0xffffffff: (7, 'B'),
+    zlib.crc32(b'SaveElikaActionCompass') & 0xffffffff: (8, 'B'),
+    zlib.crc32(b'SaveElikaUnderPersistantScenaricControl') & 0xffffffff: (9, 'B'),
+    zlib.crc32(b'SaveElikaIsCaptured') & 0xffffffff: (10, 'B'),
+}
+
+_SAVE_ELIKA_CAPTURED_POS = zlib.crc32(b'SaveElikaCapturedPos') & 0xffffffff
+_ACTIVE_ODD_TAGS = zlib.crc32(b'ActiveODDTags') & 0xffffffff
+
+
 def resolve_multi_component(decompressed, record_offset, prop_hash):
     """Component rows for a multi-number field (see MULTI_COMPONENT_OFFSETS), as
     [(label, absolute_offset, fmt, value), ...], or None if this field isn't one of them."""
     entry = MULTI_COMPONENT_OFFSETS.get(prop_hash)
-    if entry is None:
+    if entry is not None:
+        base, comps = entry
+        base += record_offset
+    elif prop_hash == _SAVE_ELIKA_CAPTURED_POS:
+        # Same translation-row treatment as the other transforms, but its position depends on the
+        # array length rather than being fixed.
+        tail = popgameplaymanager_tail_start(decompressed, record_offset)
+        if tail is None:
+            return None
+        base = tail + 11
+        comps = [('X', 48, '<f'), ('Y', 52, '<f'), ('Z', 56, '<f')]
+    else:
         return None
-    base, comps = entry
     out = []
     for label, rel, fmt in comps:
-        off = record_offset + base + rel
+        off = base + rel
         if off + struct.calcsize(fmt) > len(decompressed):
             return None
         out.append((label, off, fmt, struct.unpack_from(fmt, decompressed, off)[0]))
     return out
+
+
+def active_odd_tags(decompressed, record_offset, prop_hash):
+    """(count, [u32 entries]) for PopGamePlayManager's ActiveODDTags array, or None."""
+    if prop_hash != _ACTIVE_ODD_TAGS:
+        return None
+    off = record_offset + ACTIVE_ODD_TAGS_COUNT_OFFSET
+    if off + 4 > len(decompressed):
+        return None
+    count = struct.unpack_from('<I', decompressed, off)[0]
+    if not (0 <= count <= 4096) or off + 4 + 4 * count > len(decompressed):
+        return None
+    return count, [struct.unpack_from('<I', decompressed, off + 4 + 4 * i)[0] for i in range(count)]
 
 
 # record[0]'s 6th property, "AchievementsTrackingData" itself, is a nested struct, not a plain
@@ -826,6 +1069,14 @@ def resolve_property_value_slot(decompressed, record_offset, prop_hash, record_s
             off = record_offset + size + tail_rel
             if 0 <= off <= len(decompressed) - struct.calcsize(fmt):
                 return off, fmt
+    tail_entry = POP_GPM_TAIL_OFFSETS.get(prop_hash)
+    if tail_entry is not None:
+        rel, fmt = tail_entry
+        start = popgameplaymanager_tail_start(decompressed, record_offset)
+        if start is not None:
+            off = start + rel
+            if 0 <= off <= len(decompressed) - struct.calcsize(fmt):
+                return off, fmt
     blob_entry = SECTION_GAME_DATA_BLOB_FIELDS.get(prop_hash)
     if blob_entry is not None and name_table_end is not None:
         rel, fmt = blob_entry
@@ -870,7 +1121,50 @@ ENUM_NAMES = {
         2: 'MissionItemState_Unlocked',
         3: 'MissionItemState_Completed',
     },
+    # The four below came out of the exe's own enum tables rather than by hand. The layout, for
+    # anyone repeating this: a descriptor [array_VA][count][type_hash][type_name_VA] followed by
+    # `count` 12-byte entries of [member_name_VA][int value][name hash]. Finding it by type_hash --
+    # the same hash the schema records as the field's type -- beats searching for the name string,
+    # because half of these enums don't prefix their members with the type name.
+    #
+    # The method was checked by rerunning it on MIState and FertileGroundStatus above: it
+    # reproduces both exactly, which is what makes the four new ones trustworthy.
+    'CurrentPopGameStage': {
+        0: 'Beginning',
+        1: 'TutorialDone',
+        2: 'TreeOfLifeEvent',
+        3: 'HealingFertileGrounds',
+        4: 'KilledAriman',
+        5: 'BroughtBackElika',
+    },
+    'CurrentAct': {
+        0: 'MissionActType_Invalid',
+        1: 'MissionActType_Act1',
+        2: 'MissionActType_Act2',
+        3: 'MissionActType_Act3',
+    },
+    'BondState': {
+        0: 'STRANGERS',
+        1: 'ALLIES',
+        2: 'COMPANIONS',
+        3: 'BONDSTATE_MAXIMUM',   # sentinel/count marker, not a state the game sits in
+    },
+    'SpecialGamePlayContext': {
+        0: 'SpecialGamePlayContext_None',
+        1: 'SpecialGamePlayContext_Puzzle',
+        2: 'SpecialGamePlayContext_Challenge',
+    },
 }
+
+
+# Fields that are bit sets rather than numbers. Printing one in decimal is useless -- the whole
+# point is which bits are set, and 3479136978225463899 hides that completely.
+#
+# AllCombosUsedAtLeastOnce is one bit per combo. Confirmed by watching it across a playthrough:
+# it starts at 0, and every later save only ever ADDS bits (popcount 7, 8, 9, 10, 11, 12, 14, 15,
+# 16, 18, 19 with no bit ever going back to 0), which is exactly "have you pulled this combo off
+# yet" and nothing like a counter.
+BITMASK_FIELDS = frozenset(('AllCombosUsedAtLeastOnce',))
 
 
 def enum_name(field_name, value):
