@@ -377,8 +377,11 @@ class SaveExplorer(tk.Tk):
             if isinstance(val, float):
                 return '%.4f' % val
             elif isinstance(val, int) and prop_name in PS.BITMASK_FIELDS:
-                # A bit set, not a number -- hex shows the structure and the count says how many
-                # are actually set, which is the part anyone cares about.
+                # A bit set, not a number. Narrow masks read best in binary (you want to see which
+                # slot is off); wide ones would be unreadable that way, so those get a bit count.
+                # Signed kinds are shown unsigned -- "-2" tells you nothing about which bit moved.
+                if -128 <= val < 256:
+                    return '0x%02x (%s)' % (val & 0xff, format(val & 0xff, '08b'))
                 return '%#018x (%d bits set)' % (val, bin(val).count('1'))
             elif isinstance(val, int) and PS.is_bool_field(prop_name):
                 # Anything other than 0/1 is worth showing loudly rather than calling it true.
@@ -697,13 +700,24 @@ class SaveExplorer(tk.Tk):
             objs = PS.enumerate_savegameobjects(dec)
             self._sgo_objs = objs
             self._sgo_dec = dec
-            # MissionItems get their own section below, walked as a proper 91-byte chain. Drop
-            # every one the aligned scan happens to land on, not just the 364-byte spans: a run
-            # only measures 364 when the next aligned typehash is exactly 4 records away, so the
-            # last record of a run turns up with an arbitrary size instead.
-            others = [o for o in objs
-                      if not PS.is_mission_item(dec, o['offset'])
-                      and not PS.is_section_game_data(dec, o['offset'])]
+            # Work out everything the dedicated sections below will claim, then let the array show
+            # only what's left. Filtering by record offset (rather than re-testing each shape here)
+            # keeps the two in step automatically -- otherwise adding a section silently starts
+            # listing those records twice, which is exactly what happened with Graph/CorruptionZone.
+            items = PS.find_mission_items(dec)
+            regions = PS.find_section_game_data(dec)
+            comps = PS.find_composites(dec)
+            graphs = PS.find_graphs(dec)
+            singles = {f: PS.find_single_field_records(dec, f)
+                       for f in ('CorruptionLevel', 'RuntimeEnabled')}
+            claimed = set()
+            claimed.update(r['offset'] for r in items)
+            claimed.update(r['offset'] for r in regions)
+            claimed.update(r['offset'] for r in comps)
+            claimed.update(r['offset'] for r in graphs)
+            for rs in singles.values():
+                claimed.update(r['offset'] for r in rs)
+            others = [o for o in objs if o['offset'] not in claimed]
             arr = self.detail_tree.insert(
                 gs, tk.END, text='SaveGameObject array (%d instances)' % len(others), open=False)
             for i, o in enumerate(others):
@@ -714,7 +728,6 @@ class SaveExplorer(tk.Tk):
                     self._insert_property_children(node, dec, o['offset'], ptab, record_size=o['size'])
 
             # Every MissionItem, walked as a 91-byte chain rather than inferred from alignment.
-            items = PS.find_mission_items(dec)
             mi = self.detail_tree.insert(
                 gs, tk.END, text='Mission items (%d)' % len(items), open=False)
             for j, it in enumerate(items):
@@ -736,18 +749,18 @@ class SaveExplorer(tk.Tk):
             # Per-region trackers: light seeds collected per area (the numbers the in-game map
             # shows), visits, fights, and whether the fertile ground is healed. Found by signature
             # for the same reason as MissionItem -- most sit at unaligned offsets.
-            regions = []
-            for r in PS.find_section_game_data(dec):
+            labelled = []
+            for r in regions:
                 nm = (PS.resolve_instance_name(r['uid']) or '%#010x' % r['uid'])
                 nm = nm.replace('(SectionGameData) ', '')
                 # "_FAKE" regions are the reduced streaming variants. They're real records with
                 # real data, they just never accumulate anything -- 0 seeds in all 2280 seen -- so
                 # they're listed but kept out of the total and sorted to the bottom.
-                regions.append((nm, '_FAKE' in nm, r))
-            live = [r for nm, fake, r in regions if r['initialized'] and not fake]
+                labelled.append((nm, '_FAKE' in nm, r))
+            live = [r for nm, fake, r in labelled if r['initialized'] and not fake]
             total = sum(r['NbSparklesCollected'] for r in live)
-            unloaded = sum(1 for nm, fake, r in regions if not r['initialized'])
-            fakes = sum(1 for nm, fake, r in regions if fake)
+            unloaded = sum(1 for nm, fake, r in labelled if not r['initialized'])
+            fakes = sum(1 for nm, fake, r in labelled if fake)
             label = 'Region trackers (%d regions, %d light seeds)' % (len(live), total)
             extra = ([('%d never loaded' % unloaded) if unloaded else ''] +
                      [('%d streaming variants' % fakes) if fakes else ''])
@@ -764,7 +777,7 @@ class SaveExplorer(tk.Tk):
                 if fake or not r['initialized'] or rank is None:
                     return (1, 1 if fake else 0, 0 if r['initialized'] else 1, 0, nm.lower())
                 return (0, 0, 0, rank, '')
-            for nm, fake, r in sorted(regions, key=_order):
+            for nm, fake, r in sorted(labelled, key=_order):
                 if fake:
                     note = '(streaming variant)'
                 elif not r['initialized']:
@@ -785,6 +798,77 @@ class SaveExplorer(tk.Tk):
                         values=(self._format_property_value(lbl, r[lbl]),))
                     self._editable[ciid] = dict(kind='property', offset=off, fmt='<I',
                                                  prop_name=lbl)
+
+            # CompositeSaveGameObject: per-component saved state (lever angles, pool rotations,
+            # fight/illusion flags, transforms). The bulk of the file by volume.
+            nkids = sum(len(c['children']) for c in comps)
+            cnode = self.detail_tree.insert(
+                gs, tk.END, open=False,
+                text='Composite objects (%d, %d components)' % (len(comps), nkids))
+            for c in comps:
+                nm = PS.resolve_instance_name(c['uid'])
+                label = nm or '%#010x' % c['uid']
+                pnode = self.detail_tree.insert(
+                    cnode, tk.END, text='  ' + label,
+                    values=('', 'CompositeSaveGameObject', '%#010x' % c['uid'],
+                            '%#x' % c['offset'], '%d B' % c['length'], 'composite'))
+                for ch in c['children']:
+                    val = PS.composite_child_value(dec, ch)
+                    if val is not None:
+                        shown = self._format_property_value(ch['name'], val)
+                    else:
+                        shown = '(%d bytes, kind %#x)' % (ch['value_len'], ch['kind'])
+                    kiid = self.detail_tree.insert(
+                        pnode, tk.END, text='    ' + ch['name'], values=(shown,))
+                    if val is not None:
+                        self._editable[kiid] = dict(
+                            kind='property', offset=ch['value_offset'],
+                            fmt=PS.COMPOSITE_SCALAR_FMT[ch['kind']], prop_name=ch['name'])
+
+            # Graph rule variables: the declaration list has long been readable, the float values
+            # sit at the end of the same record (see pop_save.parse_graph).
+            nvars = sum(len(g['variables']) for g in graphs)
+            gnode = self.detail_tree.insert(
+                gs, tk.END, open=False,
+                text='Graph rule variables (%d graphs, %d variables)' % (len(graphs), nvars))
+            for g in sorted(graphs, key=lambda g: g['klass']):
+                pnode = self.detail_tree.insert(
+                    gnode, tk.END, text='  ' + g['klass'],
+                    values=('Variables[%d]' % len(g['variables']), g['klass'],
+                            '%#010x' % g['uid'], '%#x' % g['offset'],
+                            '%d B' % g['length'], 'graph'))
+                # One row per array element, named by its real subclass -- the floats belong to
+                # the element, not to the Graph.
+                for var in g['variables']:
+                    vnode = self.detail_tree.insert(
+                        pnode, tk.END, text='    [%d] %s' % (var['index'], var['klass']),
+                        values=('',))
+                    for f in var['fields']:
+                        fiid = self.detail_tree.insert(
+                            vnode, tk.END, text='      ' + f['field_name'],
+                            values=('%.4f' % f['value'],))
+                        self._editable[fiid] = dict(kind='property', offset=f['offset'],
+                                                     fmt='<f', prop_name=f['field_name'])
+
+            # CorruptionZone / IGraphRule: one-property 48-byte records, mostly unaligned.
+            for section, field in (('Corruption zones', 'CorruptionLevel'),
+                                    ('Graph rules', 'RuntimeEnabled')):
+                found = singles[field]
+                if not found:
+                    continue
+                snode = self.detail_tree.insert(
+                    gs, tk.END, open=False,
+                    text='%s (%d, %d set)' % (section, len(found),
+                                               sum(1 for r in found if r['value'])))
+                for r in found:
+                    nm = PS.resolve_instance_name(r['uid']) or '%#010x' % r['uid']
+                    riid = self.detail_tree.insert(
+                        snode, tk.END, text='  ' + nm,
+                        values=(self._format_property_value(field, r['value']),
+                                field, '%#010x' % r['uid'], '%#x' % r['offset'],
+                                '%d B' % PS.SINGLE_FIELD_RECORD_SIZE, 'signature'))
+                    self._editable[riid] = dict(kind='property', offset=r['value_offset'],
+                                                 fmt='B', prop_name=field)
 
             # Records enumerate_savegameobjects() structurally can't see (non-4-byte-aligned
             # typehash) -- found via a separate, narrowly-targeted class-signature lookup instead

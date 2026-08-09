@@ -470,6 +470,234 @@ def find_section_game_data(decompressed):
     return out
 
 
+# CompositeSaveGameObject: the biggest thing in the file by volume and, until now, entirely
+# unparsed -- 96% of the bytes nothing else accounted for. Not to be confused with the 364-byte
+# spans that used to be mislabelled this (see find_mission_items); those were an alignment
+# artifact, whereas these carry the real typehash below.
+#
+# The schema gives it one field, SavedObjects, a kind-30 array, and it holds per-component saved
+# state: lever angles, pool rotations, whether a fight is done, whether an illusion is dead, AI
+# control flags, and object transforms.
+#
+#   header  0..31   [typehash][uid][2 shared class tags][own property count = 0][gap]
+#                   [u32 child count @ +28]
+#   child           [uid][2 tags][property count = 1][5-byte gap]
+#                   [11-byte name record][5 bytes][u16 kind][u32 blob length][blob]
+#                   -- so a child is 43 + blob length bytes
+#
+# Sanity of the grammar: 10906 composites end exactly on the next one, 1568 stop short (other
+# record types sit in between), and only 189 of ~12600 don't parse. Every child that parses has
+# exactly one property.
+COMPOSITE_TYPEHASH = 0x2198212e
+_COMPOSITE_HEADER = 32
+_COMPOSITE_CHILD_FIXED = 43
+
+
+def parse_composite(decompressed, offset):
+    """Parse one CompositeSaveGameObject at `offset`. Returns dict(offset, uid, length, children)
+    where each child is dict(uid, name, kind, value_offset, value_len), or None if the bytes don't
+    fit the grammar."""
+    n = len(decompressed)
+    if offset + _COMPOSITE_HEADER > n:
+        return None
+    if struct.unpack_from('<I', decompressed, offset)[0] != COMPOSITE_TYPEHASH:
+        return None
+    count = struct.unpack_from('<I', decompressed, offset + 28)[0]
+    if not (0 <= count <= 64):
+        return None
+    p = offset + _COMPOSITE_HEADER
+    children = []
+    for _ in range(count):
+        if p + 21 > n:
+            return None
+        if struct.unpack_from('<I', decompressed, p + 12)[0] != 1:
+            return None            # every child in the corpus declares exactly one property
+        if p + _COMPOSITE_CHILD_FIXED > n:
+            return None
+        name_hash = struct.unpack_from('<I', decompressed, p + 21)[0]
+        kind = struct.unpack_from('<H', decompressed, p + 37)[0]
+        blob_len = struct.unpack_from('<I', decompressed, p + 39)[0]
+        if blob_len > 4096 or p + _COMPOSITE_CHILD_FIXED + blob_len > n:
+            return None
+        children.append(dict(uid=struct.unpack_from('<I', decompressed, p)[0],
+                             name=names_lookup(name_hash), name_hash=name_hash, kind=kind,
+                             value_offset=p + _COMPOSITE_CHILD_FIXED, value_len=blob_len))
+        p += _COMPOSITE_CHILD_FIXED + blob_len
+    return dict(offset=offset, uid=struct.unpack_from('<I', decompressed, offset + 4)[0],
+                length=p - offset, children=children)
+
+
+def find_composites(decompressed):
+    """Every CompositeSaveGameObject that parses cleanly, in file order."""
+    out = []
+    needle = struct.pack('<I', COMPOSITE_TYPEHASH)
+    i = decompressed.find(needle)
+    while i != -1:
+        rec = parse_composite(decompressed, i)
+        if rec is not None:
+            out.append(rec)
+            i = decompressed.find(needle, i + max(rec['length'], 4))
+        else:
+            i = decompressed.find(needle, i + 4)
+    return out
+
+
+# Struct formats for the scalar kinds these children actually use. Multi-number kinds (Vector4,
+# quaternion, transform) are left out on purpose -- callers show those as components.
+COMPOSITE_SCALAR_FMT = {0: 'B', 3: 'b', 5: '<H', 6: '<I', 7: '<I', 10: '<f', 0x19: '<I'}
+
+
+def composite_child_value(decompressed, child):
+    """Decoded value for a child whose kind is a plain scalar, else None."""
+    fmt = COMPOSITE_SCALAR_FMT.get(child['kind'])
+    if fmt is None or struct.calcsize(fmt) != child['value_len']:
+        return None
+    return struct.unpack_from(fmt, decompressed, child['value_offset'])[0]
+
+
+# Graph records -- the rule-system state, and the biggest thing left unparsed after composites.
+# A Graph declares three fields but only Variables is save-persisted, so what a record actually
+# contains is that array:
+#
+#   0..24     standard 25-byte header; the count field is 1 + number of declarations
+#   25..37    the RulesLibraryBook reference (its name hash, then the book it points at)
+#   38..      one 17-byte PropertyPath declaration per variable-field, in order
+#   tail      one float per declaration, in the same order -- the LAST 4*N bytes of the record
+#
+# The declaration list has been readable for a long time; the values had not been located, and got
+# written up as a "declaration list plus external value buffer" wall. They aren't external -- they
+# sit at the end of the same record, and anchoring to the end is what finds them. The bytes between
+# the declarations and the floats are still not understood (they don't divide evenly by either
+# declaration or variable count), but nothing needs them to read the values.
+#
+# Confidence: floats come out sane in 107 of 108 records, and they read as real data --
+# Duration 0.7 / 2.0 / 15.0 seconds, and RuntimeValue matching OriginalValue on untouched variables.
+GRAPH_DECLARATIONS_OFFSET = 38
+
+# Which Graph subclass each record is. The save doesn't say: a Graph record carries the same
+# 25-byte header as everything else, and the two class-ish tags in it are shared between subclasses
+# (VoiceGraph and AnimationGraph have identical tags, as do FXGraph and CameraGraph), so they can't
+# be used for this. The uid can: the game only ever instantiates one of each, with a fixed uid, so
+# the whole set is six records that appear once per save.
+#
+# Identified in ACViewer, which reads the class from the .forge resource. Verified against the
+# corpus: exactly these six uids appear, one of each in 106 of 107 saves, and each keeps a stable
+# variable count (VoiceGraph always 35, FXGraph 14, CameraGraph 1, and so on).
+GRAPH_CLASS_BY_UID = {
+    0x0d4bc26a: 'VoiceGraph',
+    0x14a38039: 'TutorialGraph',
+    0x6fab4001: 'FXGraph',
+    0xc4210004: 'AnimationGraph',
+    0xc58f04b4: 'CameraGraph',
+    0xda22e3a4: 'PopAudioGraph',
+}
+
+
+def graph_class(uid):
+    """Graph subclass name for a record uid, or 'Graph' if it's one we haven't identified."""
+    return GRAPH_CLASS_BY_UID.get(uid & 0xffffffff, 'Graph')
+
+
+def parse_graph(decompressed, offset, end=None):
+    """Parse a Graph record at `offset`. Returns dict(offset, uid, declarations, values, length)
+    or None. `end` is the record end; when omitted it's taken as the next record header."""
+    n = len(decompressed)
+    if offset + GRAPH_DECLARATIONS_OFFSET > n:
+        return None
+    if struct.unpack_from('<I', decompressed, offset)[0] != ROOT_TYPEHASH:
+        return None
+    decls = walk_property_declarations(decompressed, offset + GRAPH_DECLARATIONS_OFFSET)
+    if not decls:
+        return None
+    if end is None:
+        end = n
+        for th in (ROOT_TYPEHASH, COMPOSITE_TYPEHASH):
+            j = decompressed.find(struct.pack('<I', th),
+                                   offset + GRAPH_DECLARATIONS_OFFSET + 17 * len(decls))
+            if j != -1:
+                end = min(end, j)
+    start = end - 4 * len(decls)
+    if start < offset + GRAPH_DECLARATIONS_OFFSET + 17 * len(decls):
+        return None
+    values = []
+    for k, d in enumerate(decls):
+        values.append(dict(index=d['index'], field_name=d['field_name'],
+                           class_name=d['class_name'], offset=start + 4 * k,
+                           value=struct.unpack_from('<f', decompressed, start + 4 * k)[0]))
+    # Variables is a polymorphic array (ObjectPtr<IGraphVariable>), so each element is its own
+    # small object and the floats belong to it rather than to the Graph. Which subclass it is can
+    # be read straight off the fields present: a DelayTimer declares Duration, a GraphVariable
+    # declares RuntimeValue and OriginalValue. Grouping by the declaration's index rebuilds the
+    # array, and the element count then matches what ACViewer shows for the same record.
+    grouped = {}
+    for v in values:
+        grouped.setdefault(v['index'], []).append(v)
+    variables = []
+    for idx in sorted(grouped):
+        fields = grouped[idx]
+        names_here = {f['field_name'] for f in fields}
+        if names_here == {'Duration'}:
+            klass = 'DelayTimer'
+        elif names_here == {'RuntimeValue', 'OriginalValue'}:
+            klass = 'GraphVariable'
+        else:
+            klass = 'IGraphVariable'
+        variables.append(dict(index=idx, klass=klass, fields=fields))
+    uid = struct.unpack_from('<I', decompressed, offset + 4)[0]
+    return dict(offset=offset, uid=uid, klass=graph_class(uid), declarations=decls, values=values,
+                variables=variables, length=end - offset)
+
+
+def find_graphs(decompressed):
+    """Every Graph record, found by its RulesLibraryBook property (unaligned ones included)."""
+    out = []
+    needle = struct.pack('<I', zlib.crc32(b'RulesLibraryBook') & 0xffffffff)
+    i = decompressed.find(needle)
+    while i != -1:
+        rec = parse_graph(decompressed, i - 25)
+        if i >= 25 and rec is not None:
+            out.append(rec)
+        i = decompressed.find(needle, i + 1)
+    return out
+
+
+# CorruptionZone and IGraphRule are both a 48-byte record declaring exactly one 1-byte property,
+# and they share a byte-for-byte identical shape:
+#
+#   0..24   header (property count = 1)
+#   25..35  the 11-byte name record
+#   36..42  padding + the u16 kind
+#   43      u32 blob length = 1
+#   47      the value, running to the record boundary
+#
+# The old tail rule (last byte of the record) got the right answer but only for records the aligned
+# scan could see, and 80-87% of these sit at unaligned offsets -- they follow 91-byte MissionItem
+# runs, same as everything else in this file. Found by signature now: all 812 CorruptionLevel and
+# 408 RuntimeEnabled records match the length prefix, and every value is 0 or 1.
+SINGLE_FIELD_RECORD_SIZE = 48
+SINGLE_FIELD_VALUE_OFFSET = 47
+
+
+def find_single_field_records(decompressed, field_name):
+    """Every 48-byte one-property record for `field_name`, regardless of alignment. Returns dicts
+    of (offset, uid, value_offset, value)."""
+    needle = struct.pack('<I', zlib.crc32(field_name.encode()) & 0xffffffff)
+    out = []
+    n = len(decompressed)
+    i = decompressed.find(needle)
+    while i != -1:
+        p = i - 25
+        if (p >= 0 and p + SINGLE_FIELD_RECORD_SIZE <= n
+                and struct.unpack_from('<I', decompressed, p)[0] == ROOT_TYPEHASH
+                and struct.unpack_from('<I', decompressed, p + 16)[0] == 1
+                and struct.unpack_from('<I', decompressed, p + 43)[0] == 1):
+            out.append(dict(offset=p, uid=struct.unpack_from('<I', decompressed, p + 4)[0],
+                            value_offset=p + SINGLE_FIELD_VALUE_OFFSET,
+                            value=decompressed[p + SINGLE_FIELD_VALUE_OFFSET]))
+        i = decompressed.find(needle, i + 1)
+    return out
+
+
 def find_unaligned_records(decompressed):
     """Narrowly-targeted lookup for census-class records that enumerate_savegameobjects() misses
     because their typehash sits at a non-4-byte-aligned offset. For each class in
@@ -1164,7 +1392,18 @@ ENUM_NAMES = {
 # it starts at 0, and every later save only ever ADDS bits (popcount 7, 8, 9, 10, 11, 12, 14, 15,
 # 16, 18, 19 with no bit ever going back to 0), which is exactly "have you pulled this combo off
 # yet" and nothing like a counter.
-BITMASK_FIELDS = frozenset(('AllCombosUsedAtLeastOnce',))
+#
+# ActiveSlotData is the other one, and it is NOT an enum however much -2/-1/127 looks like one:
+# the schema gives it kind 3 (s8) with a field_typehash of 0, and a real enum always names its type
+# (MissionItemState and friends do). Only bits 0 and 7 ever vary across the whole corpus -- the
+# four values seen are 0xFF, 0xFE, 0x7F, 0x7E, with bits 1-6 permanently set -- which is a slot
+# mask, matching its sibling fields Active / ActiveSlots / ActiveInAllSlots / IsInWorld.
+#
+# It is not collection or progress state, tempting as that reading was: regions with zero light
+# seeds collected still show plenty of cleared bits, and the same region flips from 0xFE in one
+# save to 0x7F in another, which is a component being loaded into a different slot rather than
+# anything the player did.
+BITMASK_FIELDS = frozenset(('AllCombosUsedAtLeastOnce', 'ActiveSlotData'))
 
 
 def enum_name(field_name, value):
