@@ -1,57 +1,27 @@
 'use strict';
 
-// ---- mock data, used only when window.pywebview isn't present (e.g. previewing this file in
-// a plain browser instead of running it through server.py/pywebview) ----
-const MOCK_RESULT = {
-  title: '2017-11-26 01h14m24s Desert',
-  subtitle: 'Desert',
-  summary: {
-    current_act: 'Act 2',
-    light_seeds: 412,
-    light_seeds_max: 1001,
-    power_plates: [
-      { name: 'Steps of Ormazd', color: '#e5484d', enabled: true },
-      { name: 'Hand of Ormazd', color: '#3b9eff', enabled: false },
-      { name: 'Breath of Ormazd', color: '#30a46c', enabled: true },
-      { name: 'Wings of Ormazd', color: '#f5c518', enabled: false },
-    ],
-    healed_levels: 2,
-    healed_levels_total: 24,
-  },
-  tree: {
-    label: 'root', value: '', children: [
-      { label: 'Header', value: '', children: [
-        { label: 'level_name', value: 'Desert', children: [] },
-      ]},
-      { label: 'Game State (blob1)', value: '', children: [
-        { label: 'Array-container objects', value: '4 traps · 6 powers · 1 portal loaders', children: [
-          { label: 'TrapsManager', value: 'Traps[4]', children: [
-            { label: '[0]', value: '', children: [
-              { label: 'TrapType', value: 'Tremor (0)', mono: true, children: [] },
-              { label: 'Enabled', value: 'true', mono: true, children: [] },
-              { label: 'ManualActivation', value: 'false', mono: true, children: [] },
-            ]},
-          ]},
-        ]},
-      ]},
-    ],
-  },
-};
+import { parseHeader, parseBlob2, decompressBlob1, resolveCheckpointCode, HEADER_SIZE } from './js/popsave_header.js';
+import { Schema } from './js/schema.js';
+import { PopSave } from './js/popsave.js';
+import { loadSaveData } from './js/tree_builder.js';
+import { SCHEMA_CACHE } from './js/data_schema.js';
+import { FORGE_NAME_REGISTRY } from './js/data_forge_names.js';
 
-const hasApi = () => !!window.pywebview && !!window.pywebview.api;
+// Built once at startup (schema_cache.json/forge_name_registry.json are baked into
+// data_schema.js/data_forge_names.js as plain JS -- fetch()ing local JSON is blocked by CORS the
+// moment this page is opened via file:// instead of served over http://, so this is what actually
+// makes "double-click index.html, no server, no Python" work).
+const schema = new Schema(SCHEMA_CACHE, FORGE_NAME_REGISTRY);
+const ps = new PopSave(schema);
 
-function callApi(name, ...args) {
-  if (hasApi()) return window.pywebview.api[name](...args);
-  if (name === 'load_save') return Promise.resolve(MOCK_RESULT);
-  if (name === 'open_file_dialog') return Promise.resolve('mock-path');
-  return Promise.resolve(null);
+function loadSaveFromBytes(bytes, fileName) {
+  const header = parseHeader(bytes);
+  const blob2Raw = parseBlob2(bytes, HEADER_SIZE, header.blob2Size);
+  const [checkpointHash, checkpointRegion] = resolveCheckpointCode(blob2Raw.checkpointCode);
+  const blob2 = { ...blob2Raw, checkpointHash, checkpointRegion };
+  const dec = decompressBlob1(bytes, HEADER_SIZE + header.blob2Size, header.blob1Size);
+  return loadSaveData(schema, ps, header, blob2, dec, fileName);
 }
-
-// ---- title bar controls ----
-document.getElementById('btn-min').addEventListener('click', () => callApi('minimize'));
-document.getElementById('btn-max').addEventListener('click', () => callApi('toggle_maximize'));
-document.getElementById('btn-close').addEventListener('click', () => callApi('close'));
-document.getElementById('titlebar-drag').addEventListener('dblclick', () => callApi('toggle_maximize'));
 
 // ---- tree rendering ----
 // Every expanded section's header row sticks to the top of the tree while you're scrolled
@@ -240,7 +210,7 @@ function applyLoadResult(result) {
   if (!result || result.error) {
     document.getElementById('page-title').textContent = 'Failed to load save';
     document.getElementById('page-subtitle').textContent = (result && result.error) || 'unknown error';
-    renderSummary([]);
+    renderSummary(null);
     document.getElementById('tree').innerHTML = '';
     return;
   }
@@ -251,21 +221,29 @@ function applyLoadResult(result) {
   document.getElementById('search').value = '';
 }
 
-async function loadSave(path) {
-  applyLoadResult(await callApi('load_save', path));
+async function loadSaveFile(file) {
+  try {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    applyLoadResult(loadSaveFromBytes(bytes, file.name));
+  } catch (e) {
+    applyLoadResult({ error: e.message });
+  }
 }
 
-document.getElementById('btn-load').addEventListener('click', async () => {
-  const path = await callApi('open_file_dialog');
-  if (path) await loadSave(path);
+// ---- Load Save button: hidden <input type=file>, browser-native picker ----
+const fileInput = document.createElement('input');
+fileInput.type = 'file';
+fileInput.accept = '.PoPSavedGame';
+fileInput.style.display = 'none';
+document.body.appendChild(fileInput);
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) loadSaveFile(fileInput.files[0]);
+  fileInput.value = '';   // allow picking the same file again later
 });
+document.getElementById('btn-load').addEventListener('click', () => fileInput.click());
 
-// Called by server.py's setup_drag_drop (via window.evaluate_js) once a real OS drag-and-drop
-// resolves to an actual filesystem path -- see that function's docstring for why this can't just
-// be a plain JS 'drop' listener.
-window.__onSaveDropped = (result) => applyLoadResult(result);
-
-// ---- drag-and-drop visual feedback (path extraction itself happens in server.py) ----
+// ---- drag-and-drop: plain browser File API, no native path needed since we only ever read bytes ----
 const dropZone = document.getElementById('drop-zone');
 ['dragenter', 'dragover'].forEach((evt) => {
   dropZone.addEventListener(evt, (e) => {
@@ -273,11 +251,17 @@ const dropZone = document.getElementById('drop-zone');
     dropZone.classList.add('drag-over');
   });
 });
-['dragleave', 'drop'].forEach((evt) => {
+['dragleave'].forEach((evt) => {
   dropZone.addEventListener(evt, (e) => {
     e.preventDefault();
     dropZone.classList.remove('drag-over');
   });
+});
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) loadSaveFile(file);
 });
 
 // ---- collapsible search box ----
