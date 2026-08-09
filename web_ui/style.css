@@ -1,3 +1,13 @@
+/* Bundled, not loaded from a CDN -- this is a local desktop app and shouldn't need internet
+   access just to render its own UI. Single variable-font file covers every weight we use. */
+@font-face {
+  font-family: 'InterVariable';
+  src: url('fonts/InterVariable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #17171b;
   --bg-sidebar: #131316;
@@ -11,7 +21,7 @@
   --row-selected: #22262f;
   --accent: #5e6ad2;
   --danger: #e5484d;
-  --font-sans: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  --font-sans: "InterVariable", "Segoe UI Variable Text", "Segoe UI", sans-serif;
   --font-mono: "Cascadia Mono", Consolas, monospace;
 }
 
@@ -273,12 +283,17 @@ body {
   width: 30px;
   height: 30px;
   min-width: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 50%;
   border: 1px solid var(--border);
   background: #1c1c21;
   color: var(--text-mid);
-  font-size: 13px;
   cursor: default;
+}
+#btn-search-toggle svg {
+  display: block;
 }
 #btn-search-toggle:hover {
   background: #24242b;
@@ -312,8 +327,7 @@ body {
 }
 
 #tree-header {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
   padding: 8px 20px;
   border-bottom: 1px solid var(--border);
   color: var(--text-dim);
@@ -321,6 +335,15 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+/* Must match FIELD_COLUMN_WIDTH in app.js so this label sits directly above the actual
+   depth-0 field column, and VALUE_GAP so it sits above the value column. */
+#tree-header span:first-child {
+  flex: 0 0 400px;
+}
+#tree-header span:last-child {
+  flex: 1;
+  padding-left: 12px;
 }
 
 #tree {
@@ -337,10 +360,9 @@ body {
 .node summary::-webkit-details-marker { display: none; }
 
 .node-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
   align-items: center;
-  height: 30px;
+  height: 32px;
   padding: 0 8px;
   border-radius: 4px;
   box-sizing: border-box;
@@ -364,8 +386,12 @@ body {
 .node-field {
   display: flex;
   align-items: center;
+  flex: 0 0 auto;   /* width set inline per-row by app.js, compensated for indent depth --
+                       see FIELD_COLUMN_WIDTH -- so every row's value column starts at the
+                       same x position no matter how deeply it's nested */
   gap: 6px;
   color: #d4d4d9;
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -378,7 +404,14 @@ body {
 }
 .leaf .node-row .node-caret { visibility: hidden; }
 .node-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-left: 12px;
+  border-left: 1px solid #202024;
   color: #d4d4d9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .node-value.mono {
   font-family: var(--font-mono);

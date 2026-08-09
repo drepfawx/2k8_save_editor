@@ -570,6 +570,7 @@ GRAPH_CLASS_BY_UID = {
     0xc4210004: 'AnimationGraph',
     0xc58f04b4: 'CameraGraph',
     0xda22e3a4: 'PopAudioGraph',
+    0x20bbc006: 'AchievementSet',
 }
 
 

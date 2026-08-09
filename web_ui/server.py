@@ -79,7 +79,7 @@ def build_property_node(dec, offset, prop, record_size, name_table_end):
 
 
 def build_array_container_tree(dec, traps, powers, portals):
-    root = node("Array-container objects",
+    root = node("Traps & Powers",
                 "%d traps · %d powers · %d portal loaders" %
                 (sum(len(r['elements']) for r in traps),
                  sum(len(r['elements']) for r in powers), len(portals)))
@@ -122,9 +122,9 @@ def build_game_state_tree(dec):
     traps = PS.find_array_containers(dec, 'Traps')
     powers = PS.find_array_containers(dec, 'Powers')
     portals = PS.find_fixed_capacity_arrays(dec)
-    unaligned_all = PS.find_unaligned_records(dec)
-    pgpm_unaligned = [e for e in unaligned_all if e['klass'] == 'PopGamePlayManager']
-    other_unaligned = [e for e in unaligned_all if e['klass'] != 'PopGamePlayManager']
+    # find_unaligned_records() only ever returns PopGamePlayManager in practice (checked against
+    # the whole corpus) -- fold straight into World objects below, no separate "missed" bucket.
+    pgpm_unaligned = [e for e in PS.find_unaligned_records(dec) if e['klass'] == 'PopGamePlayManager']
 
     claimed = set()
     for rs in (items, regions, comps, graphs, traps, powers, portals):
@@ -137,7 +137,7 @@ def build_game_state_tree(dec):
                for e in pgpm_unaligned]
     others.sort(key=lambda o: o['offset'])
 
-    sections = [node('decompressed size', str(len(dec)))]
+    sections = []
 
     # -- SaveGameObject array --
     arr_children = []
@@ -161,7 +161,7 @@ def build_game_state_tree(dec):
                 current_act = PS.decode_property_value(dec, o['offset'], act_hash, record_size=o['size'],
                                                         name_table_end=ptab['name_table_end'])
         arr_children.append(rnode)
-    sections.append(node('SaveGameObject array (%d instances)' % len(others), '', children=arr_children))
+    sections.append(node('World objects (%d)' % len(others), '', children=arr_children))
 
     # -- Mission items --
     mi_children = []
@@ -216,7 +216,7 @@ def build_game_state_tree(dec):
                 '(%d bytes, kind %#x)' % (ch['value_len'], ch['kind']))
             cnode['children'].append(node(ch['name'], shown, mono=True))
         comp_children.append(cnode)
-    sections.append(node('Composite objects (%d, %d components)' % (len(comps), nkids), '', children=comp_children))
+    sections.append(node('Composite objects (%d instances, %d components)' % (len(comps), nkids), '', children=comp_children))
 
     # -- Graph rule variables --
     graph_children = []
@@ -242,23 +242,11 @@ def build_game_state_tree(dec):
         for r in found:
             nm = PS.resolve_instance_name(r['uid']) or '%#010x' % r['uid']
             sect_children.append(node(nm, format_value(field, r['value']), mono=True))
-        sections.append(node('%s (%d, %d set)' % (section, len(found), sum(1 for r in found if r['value'])),
+        sections.append(node('%s (%d found, %d set)' % (section, len(found), sum(1 for r in found if r['value'])),
                              '', children=sect_children))
 
-    # -- Array-container objects --
+    # -- Traps & Powers --
     sections.append(build_array_container_tree(dec, traps, powers, portals))
-
-    # -- Records missed by the aligned scan --
-    missed_children = []
-    for e in other_unaligned:
-        ptab = PS.read_property_table(dec, e['offset'])
-        mnode = node(e['klass'] or '(unaligned)', '')
-        if ptab:
-            for prop in ptab['properties']:
-                mnode['children'].append(build_property_node(dec, e['offset'], prop, None, ptab['name_table_end']))
-        missed_children.append(mnode)
-    sections.append(node('Records missed by the aligned scan (%d)' % len(other_unaligned),
-                         '', children=missed_children))
 
     return node('Game State (blob1)', '', children=sections), dict(
         light_seeds=total_seeds, traps=traps, powers=powers, singles=singles, current_act=current_act)
@@ -269,12 +257,9 @@ def build_header_node(sf):
     ts = h['timestamp_utc']
     children = [
         node('magic', '%#010x (RGMH)' % h['magic']),
-        node('version', str(h['version'])),
         node('title', h['title']),
         node('level_name', h['level_name']),
         node('timestamp (UTC)', ts.isoformat(sep=' ') if ts else '(invalid)'),
-        node('blob1_size', str(h['blob1_size'])),
-        node('blob2_size', str(h['blob2_size'])),
     ]
     return node('Header', '', children=children)
 
@@ -289,19 +274,28 @@ def build_checkpoint_node(sf):
     return node('Checkpoint', '', children=children)
 
 
-# Colors as specified by the user: FlyOnBeam=yellow, Dash=green, Grapple=blue, Rebound=red.
+# Display names are the real in-game ability names (Ormazd's four gifts), not the internal
+# MagicPlateComponentType enum names -- Rebound=Steps, Grapple=Hand, Dash=Breath, FlyOnBeam=Wings.
+# Colors as specified by the user: red/blue/green/yellow respectively.
 # MagicType_Invalid/MagicType_Target aren't real acquirable plates (Invalid's a sentinel; Target
 # was never called out), so they're left out of this list entirely, not just uncolored.
 POWER_PLATE_INFO = [
-    ('Rebound', 1, '#e5484d'),
-    ('Grapple', 3, '#3b9eff'),
-    ('Dash', 4, '#30a46c'),
-    ('FlyOnBeam', 5, '#f5c518'),
+    ('Step of Ormazd', 1, '#e5484d'),    # Rebound / red
+    ('Hand of Ormazd', 3, '#3b9eff'),     # Grapple / blue
+    ('Breath of Ormazd', 4, '#30a46c'),   # Dash / green
+    ('Wings of Ormazd', 5, '#f5c518'),    # FlyOnBeam / yellow
 ]
 
 LIGHT_SEEDS_MAX = 1001
 
 ACT_LABELS = {0: 'Act 0', 1: 'Act 1', 2: 'Act 2', 3: 'Act 3'}
+
+# The 24 real levels (LR1-6 / OB1-6 / RC1-6 / HC1-6). find_single_field_records('CorruptionLevel')
+# also picks up ~13 unrelated records per save (streaming "_FAKE" variants, tree/fire sub-zones,
+# CorruptionRegionCellData, ...) that aren't levels at all -- the summary panel should only ever
+# count these 24, even though the detailed tree still shows everything found.
+CORRUPTION_ZONE_NAMES = frozenset('%s%d' % (prefix, n)
+                                   for prefix in ('LR', 'OB', 'RC', 'HC') for n in range(1, 7))
 
 
 def compute_power_plates(powers):
@@ -315,8 +309,11 @@ def compute_power_plates(powers):
 
 def compute_summary(dec, extra):
     singles = extra['singles']
-    corruption_found = singles.get('CorruptionLevel', [])
-    corruption_on = sum(1 for r in corruption_found if r['value'])
+    corruption_found = [r for r in singles.get('CorruptionLevel', [])
+                         if PS.resolve_instance_name(r['uid']) in CORRUPTION_ZONE_NAMES]
+    # CorruptionLevel == 0 means clean/healed -- the summary shows progress towards healing all
+    # 24, not how many are still corrupted.
+    healed = sum(1 for r in corruption_found if not r['value'])
     act = extra['current_act']
 
     return dict(
@@ -324,8 +321,8 @@ def compute_summary(dec, extra):
         light_seeds=extra['light_seeds'],
         light_seeds_max=LIGHT_SEEDS_MAX,
         power_plates=compute_power_plates(extra['powers']),
-        corruption_on=corruption_on,
-        corruption_total=len(corruption_found),
+        healed_levels=healed,
+        healed_levels_total=len(CORRUPTION_ZONE_NAMES),
     )
 
 

@@ -10,13 +10,13 @@ const MOCK_RESULT = {
     light_seeds: 412,
     light_seeds_max: 1001,
     power_plates: [
-      { name: 'Rebound', color: '#e5484d', enabled: true },
-      { name: 'Grapple', color: '#3b9eff', enabled: false },
-      { name: 'Dash', color: '#30a46c', enabled: true },
-      { name: 'FlyOnBeam', color: '#f5c518', enabled: false },
+      { name: 'Steps of Ormazd', color: '#e5484d', enabled: true },
+      { name: 'Hand of Ormazd', color: '#3b9eff', enabled: false },
+      { name: 'Breath of Ormazd', color: '#30a46c', enabled: true },
+      { name: 'Wings of Ormazd', color: '#f5c518', enabled: false },
     ],
-    corruption_on: 2,
-    corruption_total: 5,
+    healed_levels: 2,
+    healed_levels_total: 24,
   },
   tree: {
     label: 'root', value: '', children: [
@@ -57,7 +57,17 @@ document.getElementById('titlebar-drag').addEventListener('dblclick', () => call
 // Every expanded section's header row sticks to the top of the tree while you're scrolled
 // inside it (so it's always one click away to collapse), stacked by nesting depth -- e.g.
 // "Game State" sticks at the very top, "Composite objects" sticks just below it, and so on.
-const STICKY_ROW_HEIGHT = 30;
+const STICKY_ROW_HEIGHT = 32;
+
+// Rows use flex, not a per-row grid -- a grid re-splits its own (already-indented, so
+// shrinking) width into columns at every nesting level, which put the value column at a
+// different x position for every depth and was the main reason the tree read as a wall of
+// misaligned text. Instead each row's field column gets an explicit width that shrinks by
+// exactly the indent it picked up, so the value column lands at the same x for every row
+// regardless of depth -- see #tree-header's CSS, which uses the same FIELD_COLUMN_WIDTH.
+const FIELD_COLUMN_WIDTH = 320;
+const INDENT_PER_LEVEL = 24;   // must match .node-children's margin-left + padding-left
+const FIELD_COLUMN_MIN = 70;
 
 function buildNode(n, depth = 0) {
   const hasChildren = n.children && n.children.length > 0;
@@ -74,6 +84,8 @@ function buildNode(n, depth = 0) {
 
   const field = document.createElement('div');
   field.className = 'node-field';
+  field.style.width = Math.max(FIELD_COLUMN_MIN, FIELD_COLUMN_WIDTH - depth * INDENT_PER_LEVEL) + 'px';
+  field.title = n.label;
   const caret = document.createElement('span');
   caret.className = 'node-caret';
   caret.textContent = hasChildren ? '▾' : '';
@@ -85,6 +97,7 @@ function buildNode(n, depth = 0) {
   const value = document.createElement('div');
   value.className = 'node-value' + (n.mono ? ' mono' : '');
   value.textContent = n.value || '';
+  if (n.value) value.title = n.value;
 
   row.appendChild(field);
   row.appendChild(value);
@@ -105,34 +118,41 @@ function buildNode(n, depth = 0) {
 function renderTree(root) {
   const container = document.getElementById('tree');
   container.innerHTML = '';
-  // root itself is just a wrapper -- render its children as top-level sections, first two open.
-  root.children.forEach((child, i) => {
-    const el = buildNode(child);
-    if (el.tagName === 'DETAILS' && i < 3) el.open = true;
-    container.appendChild(el);
+  // root itself is just a wrapper -- render its children as top-level sections, all collapsed.
+  root.children.forEach((child) => {
+    container.appendChild(buildNode(child));
   });
 }
 
 // ---- filter ----
-function nodeMatches(el, text) {
+// `forceShow` is true once we're inside a subtree whose own branch already matched -- from
+// there down, everything shows unfiltered (matching a section name should reveal its contents,
+// not keep filtering each child against the same query). Without this, expanding a matched
+// section showed nothing: every child was independently tested against the search text and
+// hidden if it didn't happen to match too.
+function nodeMatches(el, text, forceShow) {
   const self = el.dataset.label.includes(text) || el.dataset.value.includes(text);
+  const showChildren = forceShow || self;
   let childMatch = false;
   const childWrap = el.querySelector(':scope > .node-children');
   if (childWrap) {
     for (const child of childWrap.children) {
-      if (nodeMatches(child, text)) childMatch = true;
+      if (nodeMatches(child, text, showChildren)) childMatch = true;
     }
   }
-  const visible = !text || self || childMatch;
+  const visible = !text || forceShow || self || childMatch;
   el.classList.toggle('hidden', !visible);
-  if (visible && text && el.tagName === 'DETAILS') el.open = true;
-  return self || childMatch;
+  // Auto-open the matched branch itself (and anything on the path down to a real match) so the
+  // result is immediately visible -- but don't blanket-expand every node inside it, that'd blow
+  // a single matched "Composite objects" open into thousands of expanded rows at once.
+  if (text && el.tagName === 'DETAILS' && (self || childMatch)) el.open = true;
+  return visible;
 }
 
 document.getElementById('search').addEventListener('input', (ev) => {
   const text = ev.target.value.trim().toLowerCase();
   const tree = document.getElementById('tree');
-  for (const top of tree.children) nodeMatches(top, text);
+  for (const top of tree.children) nodeMatches(top, text, false);
 });
 
 // ---- summary panel ----
@@ -208,7 +228,7 @@ function renderSummary(s) {
   list.appendChild(statCard('Current Act', s.current_act));
   list.appendChild(seedRingCard(s.light_seeds, s.light_seeds_max));
   list.appendChild(powerPlatesCard(s.power_plates));
-  list.appendChild(statCard('Corruption Zones Set', `${s.corruption_on} / ${s.corruption_total}`));
+  list.appendChild(statCard('Healed Levels', `${s.healed_levels} / ${s.healed_levels_total}`));
 }
 
 // ---- load save ----
@@ -264,6 +284,12 @@ document.getElementById('btn-search-toggle').addEventListener('click', () => {
   searchBox.classList.toggle('expanded', expanding);
   if (expanding) searchInput.focus();
 });
-searchInput.addEventListener('blur', () => {
+// Clicking the toggle button while the input is focused fires the input's blur BEFORE the
+// button's click -- collapsing here on every blur would race with the click handler above (blur
+// closes it, then the click immediately reopens it, so a second press looked like it did
+// nothing). Only auto-collapse when focus actually leaves the whole search box, not when it just
+// moves from the input to the toggle button.
+searchBox.addEventListener('focusout', (ev) => {
+  if (searchBox.contains(ev.relatedTarget)) return;
   if (!searchInput.value) searchBox.classList.remove('expanded');
 });
