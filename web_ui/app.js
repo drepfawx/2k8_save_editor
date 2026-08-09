@@ -118,9 +118,13 @@ function buildNode(n, depth = 0) {
 function renderTree(root) {
   const container = document.getElementById('tree');
   container.innerHTML = '';
-  // root itself is just a wrapper -- render its children as top-level sections, all collapsed.
+  // root itself is just a wrapper -- Header/Checkpoint/Game State (its direct children) start
+  // open since they're just top-level containers; everything nested inside Game State (World
+  // Objects, Mission Items, ...) stays collapsed so a save doesn't dump thousands of rows at once.
   root.children.forEach((child) => {
-    container.appendChild(buildNode(child));
+    const el = buildNode(child);
+    if (el.tagName === 'DETAILS') el.open = true;
+    container.appendChild(el);
   });
 }
 

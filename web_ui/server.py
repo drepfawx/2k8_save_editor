@@ -78,16 +78,32 @@ def build_property_node(dec, offset, prop, record_size, name_table_end):
     return n
 
 
-def build_array_container_tree(dec, traps, powers, portals):
-    root = node("Traps & Powers",
-                "%d traps · %d powers · %d portal loaders" %
-                (sum(len(r['elements']) for r in traps),
-                 sum(len(r['elements']) for r in powers), len(portals)))
-    for klass, field, recs in (('TrapsManager', 'Traps', traps), ('PowersManager', 'Powers', powers)):
+def _array_element_label(type_field, type_val, index):
+    """The element's own type name (e.g. 'Tremor', 'Steps of Ormazd') instead of a bare index --
+    POWER_PLATE_INFO's display names take priority for MagicPlateComponentType (matches the
+    summary panel), falling back to the raw enum name (prefix stripped) for anything else,
+    e.g. the Invalid/Target plate types the summary panel doesn't show."""
+    if type_field == 'MagicPlateComponentType':
+        nm = POWER_PLATE_NAME_BY_TYPE.get(type_val)
+        if nm:
+            return nm
+    nm = PS.enum_name(type_field, type_val)
+    if nm:
+        return nm.replace('MagicType_', '')
+    return '[%d]' % index
+
+
+def build_traps_powers_children(dec, traps, powers):
+    """TrapsManager/PowersManager rows only -- PortalDynamicLoaderSaveState lives under World
+    Objects instead (it's a leftover/misc record like everything else there, not really a
+    trap/power)."""
+    out = []
+    for klass, field, type_field, recs in (('TrapsManager', 'Traps', 'TrapType', traps),
+                                            ('PowersManager', 'Powers', 'MagicPlateComponentType', powers)):
         for r in recs:
             rnode = node(klass, '%s[%d]' % (field, len(r['elements'])))
             for k, elem in enumerate(r['elements']):
-                enode = node('[%d]' % k)
+                enode = node(_array_element_label(type_field, elem.get(type_field), k))
                 for fname, val in elem.items():
                     if fname in ('Enabled', 'ManualActivation'):
                         shown = 'true' if val else 'false'
@@ -96,7 +112,12 @@ def build_array_container_tree(dec, traps, powers, portals):
                         shown = '%s (%d)' % (nm, val) if nm else str(val)
                     enode['children'].append(node(fname, shown, mono=True))
                 rnode['children'].append(enode)
-            root['children'].append(rnode)
+            out.append(rnode)
+    return out
+
+
+def build_portal_nodes(dec, portals):
+    out = []
     for r in portals:
         used = sum(1 for x in r['object_to_save'] if x)
         pnode = node('PortalDynamicLoaderSaveState',
@@ -108,8 +129,8 @@ def build_array_container_tree(dec, traps, powers, portals):
             onode = node('ObjectToSave[%d]' % k, format_value('ObjectToSave', obj_id), mono=True)
             onode['children'].append(node('ActiveFlag', 'true' if flag else 'false', mono=True))
             pnode['children'].append(onode)
-        root['children'].append(pnode)
-    return root
+        out.append(pnode)
+    return out
 
 
 def build_game_state_tree(dec):
@@ -161,7 +182,8 @@ def build_game_state_tree(dec):
                 current_act = PS.decode_property_value(dec, o['offset'], act_hash, record_size=o['size'],
                                                         name_table_end=ptab['name_table_end'])
         arr_children.append(rnode)
-    sections.append(node('World objects (%d)' % len(others), '', children=arr_children))
+    arr_children += build_portal_nodes(dec, portals)
+    sections.append(node('World Objects (%d)' % len(arr_children), '', children=arr_children))
 
     # -- Mission items --
     mi_children = []
@@ -172,7 +194,7 @@ def build_game_state_tree(dec):
             val = dec[it['state_offset'] + rel]
             mnode['children'].append(node(lbl, format_value(lbl, val), mono=True))
         mi_children.append(mnode)
-    sections.append(node('Mission items (%d)' % len(items), '', children=mi_children))
+    sections.append(node('Mission Items (%d)' % len(items), '', children=mi_children))
 
     # -- Region trackers --
     labelled = []
@@ -197,17 +219,14 @@ def build_game_state_tree(dec):
             for lbl in ('NbTimeVisited', 'NbSparklesCollected', 'FertileGroundStatus', 'NbFightsDone'):
                 rnode['children'].append(node(lbl, format_value(lbl, r[lbl]), mono=True))
         reg_children.append(rnode)
-    sections.append(node('Region trackers (%d regions, %d light seeds)' % (len(live), total_seeds),
-                         '', children=reg_children))
+    sections.append(node('Region Trackers (%d)' % len(reg_children), '', children=reg_children))
 
     # -- Composite objects --
     comp_children = []
-    nkids = 0
     for c in comps:
         nm = PS.resolve_instance_name(c['uid']) or '%#010x' % c['uid']
         cnode = node(nm, '')
         for ch in c['children']:
-            nkids += 1
             if ch.get('empty'):
                 cnode['children'].append(node('(empty)', '%#010x' % ch['uid']))
                 continue
@@ -216,13 +235,11 @@ def build_game_state_tree(dec):
                 '(%d bytes, kind %#x)' % (ch['value_len'], ch['kind']))
             cnode['children'].append(node(ch['name'], shown, mono=True))
         comp_children.append(cnode)
-    sections.append(node('Composite objects (%d instances, %d components)' % (len(comps), nkids), '', children=comp_children))
+    sections.append(node('Composite Objects (%d)' % len(comp_children), '', children=comp_children))
 
     # -- Graph rule variables --
     graph_children = []
-    nvars = 0
     for g in sorted(graphs, key=lambda g: g['klass']):
-        nvars += len(g['variables'])
         gnode = node(g['klass'], 'Variables[%d]' % len(g['variables']))
         for var in g['variables']:
             vnode = node('[%d] %s' % (var['index'], var['klass']), '')
@@ -230,11 +247,10 @@ def build_game_state_tree(dec):
                 vnode['children'].append(node(f['field_name'], '%.4f' % f['value'], mono=True))
             gnode['children'].append(vnode)
         graph_children.append(gnode)
-    sections.append(node('Graph rule variables (%d graphs, %d variables)' % (len(graphs), nvars),
-                         '', children=graph_children))
+    sections.append(node('Graph Rule Variables (%d)' % len(graph_children), '', children=graph_children))
 
     # -- Corruption zones / Graph rules --
-    for section, field in (('Corruption zones', 'CorruptionLevel'), ('Graph rules', 'RuntimeEnabled')):
+    for section, field in (('Corruption Zones', 'CorruptionLevel'), ('Graph Rules', 'RuntimeEnabled')):
         found = singles[field]
         if not found:
             continue
@@ -242,11 +258,11 @@ def build_game_state_tree(dec):
         for r in found:
             nm = PS.resolve_instance_name(r['uid']) or '%#010x' % r['uid']
             sect_children.append(node(nm, format_value(field, r['value']), mono=True))
-        sections.append(node('%s (%d found, %d set)' % (section, len(found), sum(1 for r in found if r['value'])),
-                             '', children=sect_children))
+        sections.append(node('%s (%d)' % (section, len(sect_children)), '', children=sect_children))
 
     # -- Traps & Powers --
-    sections.append(build_array_container_tree(dec, traps, powers, portals))
+    tp_children = build_traps_powers_children(dec, traps, powers)
+    sections.append(node('Traps & Powers (%d)' % len(tp_children), '', children=tp_children))
 
     return node('Game State (blob1)', '', children=sections), dict(
         light_seeds=total_seeds, traps=traps, powers=powers, singles=singles, current_act=current_act)
@@ -271,7 +287,7 @@ def build_checkpoint_node(sf):
         node('resolved region', b2['checkpoint_region'] or '(unknown code)'),
         node('level_name', b2['level_name']),
     ]
-    return node('Checkpoint', '', children=children)
+    return node('Checkpoint (blob2)', '', children=children)
 
 
 # Display names are the real in-game ability names (Ormazd's four gifts), not the internal
@@ -285,6 +301,7 @@ POWER_PLATE_INFO = [
     ('Breath of Ormazd', 4, '#30a46c'),   # Dash / green
     ('Wings of Ormazd', 5, '#f5c518'),    # FlyOnBeam / yellow
 ]
+POWER_PLATE_NAME_BY_TYPE = {type_val: name for name, type_val, _color in POWER_PLATE_INFO}
 
 LIGHT_SEEDS_MAX = 1001
 
