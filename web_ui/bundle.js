@@ -1508,7 +1508,7 @@ const STICKY_ROW_HEIGHT = 32;
 // misaligned text. Instead each row's field column gets an explicit width that shrinks by
 // exactly the indent it picked up, so the value column lands at the same x for every row
 // regardless of depth -- see #tree-header's CSS, which uses the same FIELD_COLUMN_WIDTH.
-const FIELD_COLUMN_WIDTH = 320;
+const FIELD_COLUMN_WIDTH = 600;
 const INDENT_PER_LEVEL = 24;   // must match .node-children's margin-left + padding-left
 const FIELD_COLUMN_MIN = 70;
 

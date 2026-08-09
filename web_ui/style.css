@@ -316,7 +316,7 @@ body {
 /* Must match FIELD_COLUMN_WIDTH in app.js so this label sits directly above the actual
    depth-0 field column. */
 #tree-header span:first-child {
-  flex: 0 0 320px;
+  flex: 0 0 600px;
 }
 #tree-header span:last-child {
   flex: 1;
