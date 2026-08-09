@@ -41,7 +41,9 @@ body {
   font-size: 13px;
   overflow: hidden;
   user-select: none;
-  padding: 48px;
+  padding: 32px;
+  padding-left: 100px;
+  padding-right: 100px;
 }
 
 /* ---- app card ---- */
