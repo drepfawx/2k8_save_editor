@@ -35,18 +35,13 @@ FORGE_DIR = os.environ.get('POP2008_FORGE_DIR', '.')
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forge_name_registry.json")
 
 # ---- SectionGameData decoding ----
-# SectionGameData instances (the region-visit trackers - NbTimeVisited/NbSparklesCollected/
-# FertileGroundStatus/NbFightsDone) don't have a human-authored name in the resource table
-# (`r['name'] == ''`), so it'd otherwise just show up as a raw UID. But every one of
-# SectionGameData's fields, including `SectionID` (points at the real PopWorldSection this tracker
-# belongs to, e.g. "DE3_TerraceCorridor"), has SERIALIZE_BIT set - it's a normal, fully-parseable
-# .forge object, unlike MissionItem's save-only fields. DataPC_POP0WORLD.forge's "POP0WORLD" bundle
-# holds all 162 SectionGameData templates for the whole game in one place.
+# SectionGameData instances (the region-visit trackers) have no human-authored name in the resource
+# table, so they'd otherwise show up as a raw UID. But SectionID (which points at the real
+# PopWorldSection, e.g. "DE3_TerraceCorridor") is a normal, fully-parseable .forge field, so it can
+# be decoded and used as a name.
 #
-# One instance's layout (checked against real bytes):
-#   [typehash(4)][size(4)=29][namelen(4)=0][null(1)][uid8: word0=own uid(4), word1=typehash again(4)]
-#   [SectionID(4)][NbTimeVisited(4)][NbSparklesCollected(4)][FertileGroundStatus(4)][NbFightsDone(4)]
-#   [IsBossDefeated(1)]   = 42 bytes, and that lines up exactly with the resource table's own size.
+# Layout: [typehash(4)][size(4)=29][namelen(4)=0][null(1)][uid8][SectionID(4)][4 tracker
+# fields(16)][IsBossDefeated(1)] = 42 bytes, matching the resource table's own size.
 SECTION_GAME_DATA_TH = zlib.crc32(b'SectionGameData') & 0xffffffff
 
 
@@ -103,16 +98,12 @@ def discover_forge_files(forge_dir):
 
 
 def build(forge_files=None, forge_dir=FORGE_DIR, verbose=True, out_path=None):
-    """out_path, if given, gets a checkpoint write after every forge file, not just at the end -
-    a full run over every DataPC*.forge file takes a while, and one bad bundle shouldn't wipe out
-    everything that's already been scraped (this happened once: a bundle threw a raw IndexError
-    deep in the LZSS decoder and killed an earlier un-checkpointed run with nothing saved). Any
-    exception during one bundle's decode is caught, logged, and skipped rather than aborting.
+    """out_path, if given, gets a checkpoint write after every forge file rather than just at the
+    end -- a full run takes a while, and one bad bundle shouldn't wipe out everything already
+    scraped. Any exception during one bundle's decode is caught, logged, and skipped.
 
-    Also decodes SectionGameData instances (see decode_section_game_data) and adds them to the
-    same registry as `(SectionGameData) <SectionName>` - they have no name of their own in the
-    resource table, so without this they'd just get silently dropped by the plain name-scraping
-    loop below."""
+    Also decodes SectionGameData instances (see decode_section_game_data) into the registry as
+    `(SectionGameData) <SectionName>`, since they have no name of their own."""
     if forge_files is None:
         forge_files = discover_forge_files(forge_dir)
         if verbose:

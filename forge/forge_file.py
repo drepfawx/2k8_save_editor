@@ -74,10 +74,8 @@ class ForgeFile:
         for k in range(self.count):
             uid, off = struct.unpack_from("<QQ", d, base + k*16)
             table_raw.append((uid, off, k))
-        # Header streams first, then the table, to match the order these entries logically appear
-        # in. `idx` is
-        # just a position in this combined list, not a table slot -- use header_reloff/table_index
-        # on the Entry to find where its offset field actually lives.
+        # Header streams first, then the table. `idx` is just a position in this combined list,
+        # not a table slot -- use header_reloff/table_index on the Entry to find the real offset.
         raw = header_raw + table_raw
         # size = distance to next *data* boundary (sorted offsets) or EOF
         offs = sorted({o for _, o, _ in raw if o} | {len(d)})

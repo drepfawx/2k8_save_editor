@@ -75,10 +75,9 @@ class SaveExplorer(tk.Tk):
             self._select_file(start_path)
 
     def _report_name_registry(self):
-        """Show which name registry got loaded, in the window title so it doesn't get wiped out by
-        refresh_list()'s status-bar updates. Easy to not notice you're only running the small
-        built-in fallback (~700 names) instead of the full offline-built cache (tens of thousands),
-        and that difference matters a lot for how many UIDs actually get a real name."""
+        """Show which name registry got loaded, in the window title so refresh_list()'s status-bar
+        updates don't wipe it out. Easy to miss running the small fallback (~700 names) instead of
+        the full offline cache (tens of thousands)."""
         n = len(PS.load_forge_name_registry())
         if os.path.isfile(PS.NAME_REGISTRY_CACHE):
             suffix = '[name registry: %d, full cache]' % n
@@ -317,20 +316,15 @@ class SaveExplorer(tk.Tk):
 
     # ---------------- record-tree row builders ----------------
     def _insert_record_row(self, parent, dec, iid, index, offset, uid, kind, size, tag, extra=None):
-        """Insert a top-level SaveGameObject-array record row: resolved instance name if we have
-        one (pop_save.resolve_instance_name), else a guessed class name (pop_save.
-        guess_record_class), else a generic placeholder. typehash/uid/offset/size/kind go directly
-        on this row as columns instead of child rows, so you can see what a record is without
-        expanding it. Value stays empty here since this row is just a container - the caller fills
-        in real per-field values right after this returns.
+        """Insert a top-level SaveGameObject-array record row: resolved instance name, else a
+        guessed class name, else a generic placeholder. typehash/uid/offset/size/kind go directly
+        on this row as columns so you can see what a record is without expanding it; the caller
+        fills in real values as child rows after this returns.
 
-        The 'typehash' column shows the guessed class name rather than the literal on-disk
-        typehash, since that constant is always just SaveGameObject's own value (0x089dda5b) no
-        matter what the guessed class is, so printing it on every row would be pointless. Falls
-        back to the raw hex if nothing could be guessed.
+        'typehash' column shows the guessed class name rather than the literal on-disk typehash
+        (always just SaveGameObject's own constant, not useful to print).
 
-        Returns (node, ptab) so the caller can reuse the already-computed read_property_table()
-        result instead of fetching it again."""
+        Returns (node, ptab) so the caller can reuse the already-computed property table."""
         ptab = PS.read_property_table(dec, offset, record_size=size) if dec is not None else None
         inst_name = PS.resolve_instance_name(uid)
         cls = None
@@ -402,14 +396,11 @@ class SaveExplorer(tk.Tk):
         return '(value position not yet confirmed)'
 
     def _insert_property_children(self, node, dec, offset, ptab, record_size=None):
-        """The actual per-instance field name -> value pairs -- the only thing that should ever
-        populate the Value column. record_size is passed through to decode_property_value for
-        classes (e.g. SectionGameData) whose value bytes sit at a size-relative rather than a
-        fixed offset -- see its docstring.
+        """The actual per-instance field name -> value pairs. record_size is passed through for
+        classes (e.g. SectionGameData) whose value bytes sit at a size-relative offset.
 
-        Rows whose byte position is confirmed (pop_save.resolve_property_value_slot returns
-        something) are registered in self._editable so double-clicking the Value cell can edit
-        them in place -- see on_tree_double_click/_open_edit_dialog."""
+        Rows whose byte position is confirmed get registered in self._editable so double-clicking
+        the Value cell can edit them in place -- see on_tree_double_click/_open_edit_dialog."""
         for prop in ptab['properties']:
             nte = ptab.get('name_table_end')
             val = PS.decode_property_value(dec, offset, prop['hash'], record_size=record_size,
@@ -460,11 +451,10 @@ class SaveExplorer(tk.Tk):
             self._editable[iid] = dict(kind='property', offset=off, fmt=fmt, prop_name=name)
 
     # ---------------- edit values in place ----------------
-    # Edits mutate SaveFile.decompressed_blob1 (a bytearray) directly - there's no write-back-to-
-    # disk path yet. Recompressing blob1 needs the checksum that sits between each LZSS block, and
-    # that one's still unsolved: it's not plain CRC32 and not the usual Adler-style checksum either
-    # way I tried it. A "Save" button that could write bytes the real game rejects or crashes on
-    # would be worse than not having the feature, so export-to-.bin is the safe option for now.
+    # Edits mutate SaveFile.decompressed_blob1 (a bytearray) directly -- no write-back-to-disk path
+    # yet, since recompressing needs the per-block LZSS checksum, which is still unsolved. A "Save"
+    # button that could write bytes the real game rejects would be worse than not having it, so
+    # export-to-.bin is the safe option for now.
     def on_tree_double_click(self, ev):
         if self.detail_tree.identify_region(ev.x, ev.y) == 'heading':
             return
@@ -738,12 +728,15 @@ class SaveExplorer(tk.Tk):
                 iid = self.detail_tree.insert(
                     mi, tk.END, text='  ' + name,
                     values=('', 'MissionItem', '%#010x' % it['uid'], '%#x' % it['offset'],
-                            '%d B' % PS.MISSION_ITEM_SIZE, 'chain'))
-                for lbl, rel in (('MIState', 85), ('WasEverCompleted', 89), ('WasEverPlayed', 90)):
+                            '%d B' % it['size'], 'chain'))
+                # Offsets come off the record itself rather than being hardcoded -- a handful of
+                # MissionItems use a larger header and sit 8 bytes further along.
+                for lbl, rel in (('MIState', 0), ('WasEverCompleted', 4), ('WasEverPlayed', 5)):
+                    off = it['state_offset'] + rel
                     ciid = self.detail_tree.insert(
                         iid, tk.END, text='    ' + lbl,
-                        values=(self._format_property_value(lbl, dec[it['offset'] + rel]),))
-                    self._editable[ciid] = dict(kind='property', offset=it['offset'] + rel,
+                        values=(self._format_property_value(lbl, dec[off]),))
+                    self._editable[ciid] = dict(kind='property', offset=off,
                                                  fmt='B', prop_name=lbl)
 
             # Per-region trackers: light seeds collected per area (the numbers the in-game map
