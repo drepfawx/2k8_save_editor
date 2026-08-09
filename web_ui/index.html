@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PoP2008 Save Editor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="titlebar">
+    <div id="titlebar-drag" class="pywebview-drag-region">
+      <span id="titlebar-label">PoP2008 Save Editor</span>
+    </div>
+    <div id="titlebar-buttons">
+      <button id="btn-min" title="Minimize">&#8722;</button>
+      <button id="btn-max" title="Maximize">&#9633;</button>
+      <button id="btn-close" title="Close">&#10005;</button>
+    </div>
+  </div>
+
+  <div id="body">
+    <aside id="sidebar">
+      <div id="drop-zone">
+        <button id="btn-load">Load Save&hellip;</button>
+        <p id="drop-hint">or drag a .PoPSavedGame file here</p>
+      </div>
+      <div id="summary-section">
+        <div class="sidebar-header">Summary</div>
+        <div id="summary-list">
+          <p id="summary-empty">No save loaded.</p>
+        </div>
+      </div>
+    </aside>
+
+    <main id="content">
+      <header id="page-header">
+        <div id="page-header-text">
+          <h1 id="page-title">No save loaded</h1>
+          <p id="page-subtitle">Click "Load Save..." to open a .PoPSavedGame file</p>
+        </div>
+        <div id="search-box">
+          <button id="btn-search-toggle" title="Filter fields">&#128269;</button>
+          <input id="search" type="text" placeholder="Filter fields...">
+        </div>
+      </header>
+      <div id="tree-header">
+        <span>Field</span>
+        <span>Value</span>
+      </div>
+      <div id="tree"></div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
