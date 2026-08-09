@@ -462,16 +462,22 @@ def find_section_game_data(decompressed):
 #                   -- child size = 43 + blob length
 #
 # Grammar checked against the corpus: most composites end exactly on the next one; only a small
-# fraction fail to parse. Every parseable child has exactly one property.
+# fraction fail to parse -- all of them children with a property count of 0 rather than 1: no
+# name record, no kind/blob, just the 21-byte header plus 3 trailing zero bytes (24 bytes total,
+# always 00 00 00, never resolves to an instance name). Handling that second shape takes the
+# unparsed fraction from ~1.5% to zero across the whole corpus -- every composite in every save
+# now parses.
 COMPOSITE_TYPEHASH = 0x2198212e
 _COMPOSITE_HEADER = 32
 _COMPOSITE_CHILD_FIXED = 43
+_COMPOSITE_EMPTY_CHILD_SIZE = 24
 
 
 def parse_composite(decompressed, offset):
     """Parse one CompositeSaveGameObject at `offset`. Returns dict(offset, uid, length, children)
-    where each child is dict(uid, name, kind, value_offset, value_len), or None if the bytes don't
-    fit the grammar."""
+    where each child is dict(uid, name, kind, value_offset, value_len) for a real property, or
+    dict(uid, name=None, empty=True) for a 0-property child. None if the bytes don't fit the
+    grammar."""
     n = len(decompressed)
     if offset + _COMPOSITE_HEADER > n:
         return None
@@ -485,19 +491,27 @@ def parse_composite(decompressed, offset):
     for _ in range(count):
         if p + 21 > n:
             return None
-        if struct.unpack_from('<I', decompressed, p + 12)[0] != 1:
-            return None            # every child in the corpus declares exactly one property
-        if p + _COMPOSITE_CHILD_FIXED > n:
+        nprops = struct.unpack_from('<I', decompressed, p + 12)[0]
+        uid = struct.unpack_from('<I', decompressed, p)[0]
+        if nprops == 0:
+            if p + _COMPOSITE_EMPTY_CHILD_SIZE > n:
+                return None
+            children.append(dict(uid=uid, name=None, empty=True))
+            p += _COMPOSITE_EMPTY_CHILD_SIZE
+        elif nprops == 1:
+            if p + _COMPOSITE_CHILD_FIXED > n:
+                return None
+            name_hash = struct.unpack_from('<I', decompressed, p + 21)[0]
+            kind = struct.unpack_from('<H', decompressed, p + 37)[0]
+            blob_len = struct.unpack_from('<I', decompressed, p + 39)[0]
+            if blob_len > 4096 or p + _COMPOSITE_CHILD_FIXED + blob_len > n:
+                return None
+            children.append(dict(uid=uid, name=names_lookup(name_hash), name_hash=name_hash,
+                                 kind=kind, value_offset=p + _COMPOSITE_CHILD_FIXED,
+                                 value_len=blob_len))
+            p += _COMPOSITE_CHILD_FIXED + blob_len
+        else:
             return None
-        name_hash = struct.unpack_from('<I', decompressed, p + 21)[0]
-        kind = struct.unpack_from('<H', decompressed, p + 37)[0]
-        blob_len = struct.unpack_from('<I', decompressed, p + 39)[0]
-        if blob_len > 4096 or p + _COMPOSITE_CHILD_FIXED + blob_len > n:
-            return None
-        children.append(dict(uid=struct.unpack_from('<I', decompressed, p)[0],
-                             name=names_lookup(name_hash), name_hash=name_hash, kind=kind,
-                             value_offset=p + _COMPOSITE_CHILD_FIXED, value_len=blob_len))
-        p += _COMPOSITE_CHILD_FIXED + blob_len
     return dict(offset=offset, uid=struct.unpack_from('<I', decompressed, offset + 4)[0],
                 length=p - offset, children=children)
 
@@ -523,7 +537,10 @@ COMPOSITE_SCALAR_FMT = {0: 'B', 3: 'b', 5: '<H', 6: '<I', 7: '<I', 10: '<f', 0x1
 
 
 def composite_child_value(decompressed, child):
-    """Decoded value for a child whose kind is a plain scalar, else None."""
+    """Decoded value for a child whose kind is a plain scalar, else None (including empty
+    (0-property) children, which have no value at all)."""
+    if child.get('empty'):
+        return None
     fmt = COMPOSITE_SCALAR_FMT.get(child['kind'])
     if fmt is None or struct.calcsize(fmt) != child['value_len']:
         return None
@@ -569,9 +586,11 @@ def parse_graph(decompressed, offset, end=None):
         return None
     if struct.unpack_from('<I', decompressed, offset)[0] != ROOT_TYPEHASH:
         return None
+    # decls CAN legitimately be empty -- a Graph with no rule variables at all still declares
+    # RulesLibraryBook (which is what got this offset here in the first place, via find_graphs),
+    # it just has nothing after it. One such record (uid 0x20bbc006) appears once per save; without
+    # this it fell through to the generic array as an unclassified "(unrecognized shape)".
     decls = walk_property_declarations(decompressed, offset + GRAPH_DECLARATIONS_OFFSET)
-    if not decls:
-        return None
     if end is None:
         end = n
         for th in (ROOT_TYPEHASH, COMPOSITE_TYPEHASH):
@@ -618,6 +637,106 @@ def find_graphs(decompressed):
         rec = parse_graph(decompressed, i - 25)
         if i >= 25 and rec is not None:
             out.append(rec)
+        i = decompressed.find(needle, i + 1)
+    return out
+
+
+def _find_next_record(decompressed, start, limit=4096):
+    """First ROOT_TYPEHASH/COMPOSITE_TYPEHASH occurrence at or after `start`, any alignment."""
+    end = min(start + limit, len(decompressed))
+    for cand in range(start, end):
+        if struct.unpack_from('<I', decompressed, cand)[0] in (ROOT_TYPEHASH, COMPOSITE_TYPEHASH):
+            return cand
+    return None
+
+
+# TrapsManager.Traps / PowersManager.Powers: a per-element struct array. Declared with the same
+# 17-byte PropertyPath entries as Graph.Variables (one run of 3 per element: type/Enabled/
+# ManualActivation), but the record header is a non-standard 21 bytes (typehash + 3 fields + count
+# + 1-byte gap, not the usual 25-byte property-table header) and there's no length-prefixed value
+# blob -- the values are just packed at the record's tail, in declaration order, each field its own
+# native width. Located by working backward from the next record's start.
+ARRAY_CONTAINER_FIELDS = {
+    'Traps': ('TrapType', 'Enabled', 'ManualActivation'),
+    'Powers': ('MagicPlateComponentType', 'Enabled', 'ManualActivation'),
+}
+ARRAY_ELEMENT_WIDTH = {'TrapType': 4, 'MagicPlateComponentType': 4, 'Enabled': 1, 'ManualActivation': 1}
+
+
+def find_array_containers(decompressed, field_name):
+    """Every TrapsManager/PowersManager instance for `field_name` ('Traps' or 'Powers'). Returns
+    dicts(offset, uid, elements) -- elements is a list of {field_name: value} dicts, one per
+    declared array index."""
+    fields = ARRAY_CONTAINER_FIELDS[field_name]
+    needle = struct.pack('<I', zlib.crc32(field_name.encode()) & 0xffffffff)
+    out = []
+    i = decompressed.find(needle)
+    while i != -1:
+        p = i - 4
+        if (p >= 0 and struct.unpack_from('<I', decompressed, p)[0] == 2
+                and struct.unpack_from('<H', decompressed, p + 8)[0] == 0):
+            rec_off = p - 21
+            if rec_off >= 0 and struct.unpack_from('<I', decompressed, rec_off)[0] == ROOT_TYPEHASH:
+                decls = walk_property_declarations(decompressed, p)
+                vend = p + 17 * len(decls)
+                total_w = sum(ARRAY_ELEMENT_WIDTH[d['field_name']] for d in decls)
+                nxt = _find_next_record(decompressed, vend)
+                if nxt is not None and nxt - vend >= total_w and len(decls) % len(fields) == 0:
+                    off = nxt - total_w
+                    elements, elem = [], {}
+                    for d in decls:
+                        w = ARRAY_ELEMENT_WIDTH[d['field_name']]
+                        elem[d['field_name']] = (decompressed[off] if w == 1
+                                                  else struct.unpack_from('<I', decompressed, off)[0])
+                        off += w
+                        if len(elem) == len(fields):
+                            elements.append(elem)
+                            elem = {}
+                    uid = struct.unpack_from('<I', decompressed, rec_off + 4)[0]
+                    out.append(dict(offset=rec_off, uid=uid, elements=elements, value_offset=nxt - total_w))
+        i = decompressed.find(needle, i + 1)
+    return out
+
+
+# PortalDynamicLoaderSaveState.ObjectToSave/ActiveFlag: fixed-capacity (always 50), zero-padded
+# u32 arrays following the record's normal property table. The first array is preceded by a
+# constant 19-byte type-descriptor block (the field's schema trailer, embedded twice); the second
+# array has no descriptor of its own -- just [u32 capacity][capacity x u32] immediately.
+_FIXED_ARRAY_PREAMBLE = bytes.fromhex('00000000009e030000000000009e0310000000')
+FIXED_ARRAY_CAPACITY = 50
+
+
+def find_fixed_capacity_arrays(decompressed):
+    """Every PortalDynamicLoaderSaveState instance. Returns dicts(offset, uid, object_to_save,
+    active_flag, object_to_save_offset, active_flag_offset) -- both value lists are fixed at 50
+    entries; a zero entry means "nothing in that slot"."""
+    needle = struct.pack('<I', zlib.crc32(b'ObjectToSave') & 0xffffffff)
+    out = []
+    n = len(decompressed)
+    i = decompressed.find(needle)
+    while i != -1:
+        rec_off = None
+        for b in range(0, 400):
+            if i - b >= 0 and struct.unpack_from('<I', decompressed, i - b)[0] == ROOT_TYPEHASH:
+                rec_off = i - b
+                break
+        if rec_off is not None:
+            t = read_property_table(decompressed, rec_off)
+            if t and [p['name'] for p in t['properties']] == ['ObjectToSave', 'ActiveFlag']:
+                vstart = t['name_table_end']
+                cap = FIXED_ARRAY_CAPACITY
+                if (vstart + 19 + 4 + cap * 4 + 4 + cap * 4 <= n
+                        and decompressed[vstart:vstart + 19] == _FIXED_ARRAY_PREAMBLE
+                        and struct.unpack_from('<I', decompressed, vstart + 19)[0] == cap):
+                    list1 = vstart + 23
+                    list2_cap_off = list1 + 4 * cap
+                    if struct.unpack_from('<I', decompressed, list2_cap_off)[0] == cap:
+                        list2 = list2_cap_off + 4
+                        obj_ids = [struct.unpack_from('<I', decompressed, list1 + 4 * k)[0] for k in range(cap)]
+                        flags = [struct.unpack_from('<I', decompressed, list2 + 4 * k)[0] for k in range(cap)]
+                        uid = struct.unpack_from('<I', decompressed, rec_off + 4)[0]
+                        out.append(dict(offset=rec_off, uid=uid, object_to_save=obj_ids, active_flag=flags,
+                                        object_to_save_offset=list1, active_flag_offset=list2))
         i = decompressed.find(needle, i + 1)
     return out
 
@@ -1245,6 +1364,22 @@ ENUM_NAMES = {
         0: 'SpecialGamePlayContext_None',
         1: 'SpecialGamePlayContext_Puzzle',
         2: 'SpecialGamePlayContext_Challenge',
+    },
+    'TrapType': {
+        0: 'Tremor',
+        1: 'Geyser',
+        2: 'Swarm',
+        3: 'GooGaz',
+        4: 'Poison',
+        5: 'InvalidTrap',
+    },
+    'MagicPlateComponentType': {
+        0: 'MagicType_Invalid',
+        1: 'MagicType_Rebound',
+        2: 'MagicType_Target',
+        3: 'MagicType_Grapple',
+        4: 'MagicType_Dash',
+        5: 'MagicType_FlyOnBeam',
     },
 }
 

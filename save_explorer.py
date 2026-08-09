@@ -380,7 +380,7 @@ class SaveExplorer(tk.Tk):
             elif isinstance(val, int) and PS.is_bool_field(prop_name):
                 # Anything other than 0/1 is worth showing loudly rather than calling it true.
                 return {0: 'false (0)', 1: 'true (1)'}.get(val, '%d (unexpected for a bool)' % val)
-            elif prop_name.endswith('ID'):
+            elif prop_name.endswith('ID') or prop_name == 'ObjectToSave':
                 # These hold the same instance-name hash the .forge resource tables use, so the
                 # offline name cache turns them into the real thing ("DE3_Terrace" rather than
                 # 0xd220800e). Every nonzero ID in the corpus resolves; keep the raw hex alongside
@@ -688,7 +688,6 @@ class SaveExplorer(tk.Tk):
         else:
             self.detail_tree.insert(gs, tk.END, text='decompressed size', values=(len(dec),))
             objs = PS.enumerate_savegameobjects(dec)
-            self._sgo_objs = objs
             self._sgo_dec = dec
             # Work out everything the dedicated sections below will claim, then let the array show
             # only what's left. Filtering by record offset (rather than re-testing each shape here)
@@ -700,6 +699,17 @@ class SaveExplorer(tk.Tk):
             graphs = PS.find_graphs(dec)
             singles = {f: PS.find_single_field_records(dec, f)
                        for f in ('CorruptionLevel', 'RuntimeEnabled')}
+            traps = PS.find_array_containers(dec, 'Traps')
+            powers = PS.find_array_containers(dec, 'Powers')
+            portals = PS.find_fixed_capacity_arrays(dec)
+            # PopGamePlayManager decodes exactly the same way regardless of alignment (every
+            # offset it uses is relative to the record, not to a computed size) -- the ONLY class
+            # find_unaligned_records() ever actually returns (checked against the whole corpus).
+            # Folding its unaligned hits into the normal array means it's never split between two
+            # sections just because of where it happened to land in the byte stream.
+            unaligned = PS.find_unaligned_records(dec)
+            pgpm_unaligned = [e for e in unaligned if e['klass'] == 'PopGamePlayManager']
+            self._sgo_unaligned = [e for e in unaligned if e['klass'] != 'PopGamePlayManager']
             claimed = set()
             claimed.update(r['offset'] for r in items)
             claimed.update(r['offset'] for r in regions)
@@ -707,7 +717,14 @@ class SaveExplorer(tk.Tk):
             claimed.update(r['offset'] for r in graphs)
             for rs in singles.values():
                 claimed.update(r['offset'] for r in rs)
+            claimed.update(r['offset'] for r in traps)
+            claimed.update(r['offset'] for r in powers)
+            claimed.update(r['offset'] for r in portals)
             others = [o for o in objs if o['offset'] not in claimed]
+            others += [dict(offset=e['offset'], end=None, size=None, uid=e['uid'], kind='unaligned')
+                       for e in pgpm_unaligned]
+            others.sort(key=lambda o: o['offset'])
+            self._sgo_objs = others
             arr = self.detail_tree.insert(
                 gs, tk.END, text='SaveGameObject array (%d instances)' % len(others), open=False)
             for i, o in enumerate(others):
@@ -806,6 +823,11 @@ class SaveExplorer(tk.Tk):
                     values=('', 'CompositeSaveGameObject', '%#010x' % c['uid'],
                             '%#x' % c['offset'], '%d B' % c['length'], 'composite'))
                 for ch in c['children']:
+                    if ch.get('empty'):
+                        # A 0-property child -- no name, no value, just a slot that exists.
+                        self.detail_tree.insert(pnode, tk.END, text='    (empty)',
+                                                 values=('%#010x' % ch['uid'],))
+                        continue
                     val = PS.composite_child_value(dec, ch)
                     if val is not None:
                         shown = self._format_property_value(ch['name'], val)
@@ -863,12 +885,66 @@ class SaveExplorer(tk.Tk):
                     self._editable[riid] = dict(kind='property', offset=r['value_offset'],
                                                  fmt='B', prop_name=field)
 
+            # TrapsManager.Traps / PowersManager.Powers (struct arrays of trap/power instances)
+            # and PortalDynamicLoaderSaveState.ObjectToSave/ActiveFlag (fixed 50-slot object ID
+            # lists) -- non-standard headers the generic property-table reader can't decode, so
+            # they're claimed out of "SaveGameObject array" above the same way Graph/Composite are.
+            an = self.detail_tree.insert(
+                gs, tk.END, open=False,
+                text='Array-container objects (%d traps, %d powers, %d portal loaders)'
+                     % (sum(len(r['elements']) for r in traps),
+                        sum(len(r['elements']) for r in powers), len(portals)))
+            # Both classes are per-save singletons with a runtime-assigned uid resolve_instance_name
+            # can't name -- the class name itself is the more useful label.
+            for klass, field, recs in (('TrapsManager', 'Traps', traps), ('PowersManager', 'Powers', powers)):
+                for r in recs:
+                    rnode = self.detail_tree.insert(
+                        an, tk.END, text='  ' + klass,
+                        values=('%s[%d]' % (field, len(r['elements'])), klass,
+                                '%#010x' % r['uid'], '%#x' % r['offset'], '', 'array_container'))
+                    off = r['value_offset']
+                    for k, elem in enumerate(r['elements']):
+                        enode = self.detail_tree.insert(rnode, tk.END, text='    [%d]' % k, values=('',))
+                        for fname, val in elem.items():
+                            w = PS.ARRAY_ELEMENT_WIDTH[fname]
+                            fiid = self.detail_tree.insert(
+                                enode, tk.END, text='      ' + fname,
+                                values=(self._format_property_value(fname, val),))
+                            self._editable[fiid] = dict(kind='property', offset=off,
+                                                         fmt=('B' if w == 1 else '<I'), prop_name=fname)
+                            off += w
+
+            # PortalDynamicLoaderSaveState: which world-section bundles to restore state for on the
+            # next portal use (ObjectToSave, resolved via the forge name registry where possible)
+            # and whether each is currently active (ActiveFlag). Fixed 50-slot capacity, mostly
+            # empty -- only occupied slots (either field nonzero) are shown.
+            for r in portals:
+                used = sum(1 for x in r['object_to_save'] if x)
+                pnode = self.detail_tree.insert(
+                    an, tk.END, text='  PortalDynamicLoaderSaveState',
+                    values=('%d/%d slots used' % (used, PS.FIXED_ARRAY_CAPACITY),
+                            'PortalDynamicLoaderSaveState', '%#010x' % r['uid'],
+                            '%#x' % r['offset'], '', 'fixed_array'))
+                for k in range(PS.FIXED_ARRAY_CAPACITY):
+                    obj_id, flag = r['object_to_save'][k], r['active_flag'][k]
+                    if not obj_id and not flag:
+                        continue
+                    oiid = self.detail_tree.insert(
+                        pnode, tk.END, text='    ObjectToSave[%d]' % k,
+                        values=(self._format_property_value('ObjectToSave', obj_id),))
+                    self._editable[oiid] = dict(kind='property', offset=r['object_to_save_offset'] + k * 4,
+                                                 fmt='<I', prop_name='ObjectToSave')
+                    fiid = self.detail_tree.insert(
+                        oiid, tk.END, text='      ActiveFlag', values=(str(flag),))
+                    self._editable[fiid] = dict(kind='property', offset=r['active_flag_offset'] + k * 4,
+                                                 fmt='<I', prop_name='ActiveFlag')
+
             # Records enumerate_savegameobjects() structurally can't see (non-4-byte-aligned
-            # typehash) -- found via a separate, narrowly-targeted class-signature lookup instead
-            # (see pop_save.find_unaligned_records() for why the general scanner isn't safe to
-            # widen yet).
-            unaligned = PS.find_unaligned_records(dec)
-            self._sgo_unaligned = unaligned
+            # typehash) and that don't already have a fully-understood, alignment-independent
+            # decode (unlike PopGamePlayManager, folded into the array above) -- found via a
+            # separate, narrowly-targeted class-signature lookup instead (see
+            # pop_save.find_unaligned_records() for why the general scanner isn't safe to widen yet).
+            unaligned = self._sgo_unaligned
             ua_node = self.detail_tree.insert(
                 gs, tk.END,
                 text='Records missed by the aligned scan (%d found via class-signature lookup)' % len(unaligned),
@@ -899,7 +975,10 @@ class SaveExplorer(tk.Tk):
             if not objs or idx >= len(objs):
                 return
             o = objs[idx]
-            self._show_hex(dec[o['offset']:o['end']])
+            # Unaligned entries folded in from find_unaligned_records() have no computed end
+            # (their true size isn't tracked) -- show a generous fixed window instead.
+            end = o['end'] if o['end'] is not None else o['offset'] + 512
+            self._show_hex(dec[o['offset']:end])
         elif sel[0].startswith('ua_'):
             idx = int(sel[0].split('_', 1)[1])
             unaligned = getattr(self, '_sgo_unaligned', None)
